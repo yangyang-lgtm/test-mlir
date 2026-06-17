@@ -22,12 +22,16 @@
 
 #include "hexagon/Transforms/Passes.h"
 
+#include "mlir/Analysis/AliasAnalysis.h"
+#include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/Pass.h"
 
+#include "llvm/ADT/SetVector.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
@@ -53,7 +57,7 @@ struct ScheduleTriplet {
 struct SingleBufferSchedule {
   scf::ForOp forOp;
   SmallVector<ScheduleTriplet> triplets;
-  Operation *compute;
+  SmallVector<Operation *> computeOps;
   SmallVector<memref::CopyOp> stores;
 };
 
@@ -79,6 +83,19 @@ memref::AllocOp findBaseAlloc(Value value) {
     }
     return nullptr;
   }
+}
+
+bool isSameCopy(memref::CopyOp lhs, memref::CopyOp rhs) {
+  return lhs.getOperation() == rhs.getOperation();
+}
+
+bool isAvailableBeforeCopy(memref::AllocOp alloc, scf::ForOp forOp,
+                           memref::CopyOp copy) {
+  Block *forBody = forOp.getBody();
+  if (alloc->getBlock() == forBody)
+    return alloc->isBeforeInBlock(copy);
+  return alloc->getBlock() == forOp->getBlock() &&
+         alloc->isBeforeInBlock(forOp);
 }
 
 bool isDefinedInBlockBefore(Operation *op, Block *block, Operation *limit) {
@@ -114,6 +131,244 @@ memref::CopyOp cloneCopyWithMappedSlices(memref::CopyOp copy,
   return memref::CopyOp::create(rewriter, copy.getLoc(), source, target);
 }
 
+Operation *cloneOpWithMappedSlices(Operation *op, IRRewriter &rewriter,
+                                   IRMapping &mapping, Block *sourceBlock) {
+  for (Value operand : op->getOperands())
+    cloneValueSlice(operand, rewriter, mapping, sourceBlock, op);
+
+  Operation *cloned = op->clone(mapping);
+  rewriter.insert(cloned);
+  mapping.map(op->getResults(), cloned->getResults());
+  return cloned;
+}
+
+struct TileDataflowAnalysis {
+  AliasAnalysis &aliasAnalysis;
+  scf::ForOp forOp;
+  SingleBufferSchedule &schedule;
+  bool verifiedTiledGenericParallel;
+  llvm::SmallDenseSet<Operation *> tileAllocs;
+  llvm::SmallDenseSet<Operation *> preloadCopies;
+  SetVector<Operation *> storeBackwardSlice;
+
+  bool aliasesTileBuffer(Value value) {
+    if (!isa<BaseMemRefType>(value.getType()))
+      return false;
+
+    for (Operation *op : tileAllocs) {
+      Value tileBuffer = cast<memref::AllocOp>(op).getMemref();
+      if (aliasAnalysis.alias(value, tileBuffer))
+        return true;
+    }
+    return false;
+  }
+
+  bool opUsesTileBufferValue(Operation *op) {
+    bool touches = false;
+    op->walk([&](Operation *nestedOp) {
+      if (touches)
+        return WalkResult::interrupt();
+      for (Value operand : nestedOp->getOperands()) {
+        if (aliasesTileBuffer(operand)) {
+          touches = true;
+          return WalkResult::interrupt();
+        }
+      }
+      for (Value result : nestedOp->getResults()) {
+        if (aliasesTileBuffer(result)) {
+          touches = true;
+          return WalkResult::interrupt();
+        }
+      }
+      return WalkResult::advance();
+    });
+    return touches;
+  }
+
+  ModRefResult getTileModRef(Operation *op) {
+    ModRefResult result = ModRefResult::getNoModRef();
+    for (Operation *allocOp : tileAllocs) {
+      Value tileBuffer = cast<memref::AllocOp>(allocOp).getMemref();
+      result = result.merge(aliasAnalysis.getModRef(op, tileBuffer));
+    }
+    return result;
+  }
+
+  bool opTouchesTileBuffer(Operation *op) {
+    if (opUsesTileBufferValue(op))
+      return true;
+    if (isMemoryEffectFree(op))
+      return false;
+    return getTileModRef(op).isModOrRef();
+  }
+
+  bool isAllowedLocalUtilityOp(Operation *op) {
+    if (isa<memref::AllocOp, memref::DeallocOp, memref::SubViewOp,
+            memref::CastOp, memref::ReinterpretCastOp>(op))
+      return true;
+    return isMemoryEffectFree(op);
+  }
+
+  bool computeSliceTouchesAlloc(memref::AllocOp alloc) {
+    Value tileBuffer = alloc.getMemref();
+    for (Operation *compute : schedule.computeOps) {
+      bool touches = false;
+      compute->walk([&](Operation *nestedOp) {
+        if (touches)
+          return WalkResult::interrupt();
+        for (Value operand : nestedOp->getOperands()) {
+          if (isa<BaseMemRefType>(operand.getType()) &&
+              aliasAnalysis.alias(operand, tileBuffer)) {
+            touches = true;
+            return WalkResult::interrupt();
+          }
+        }
+        for (Value result : nestedOp->getResults()) {
+          if (isa<BaseMemRefType>(result.getType()) &&
+              aliasAnalysis.alias(result, tileBuffer)) {
+            touches = true;
+            return WalkResult::interrupt();
+          }
+        }
+        return WalkResult::advance();
+      });
+      if (touches)
+        return true;
+    }
+    return false;
+  }
+
+  bool collectCopyIns() {
+    Block *forBody = forOp.getBody();
+    for (Operation &op : forBody->without_terminator()) {
+      auto copy = dyn_cast<memref::CopyOp>(&op);
+      if (!copy)
+        continue;
+      auto alloc = findBaseAlloc(copy.getTarget());
+      if (!alloc || !isAvailableBeforeCopy(alloc, forOp, copy))
+        continue;
+      schedule.triplets.push_back({alloc, copy});
+      tileAllocs.insert(alloc.getOperation());
+      preloadCopies.insert(copy.getOperation());
+    }
+
+    return !schedule.triplets.empty();
+  }
+
+  bool refineCopyInsToComputeUsedBuffers() {
+    SmallVector<ScheduleTriplet> refinedTriplets;
+    llvm::SmallDenseSet<Operation *> refinedAllocs;
+    llvm::SmallDenseSet<Operation *> refinedPreloadCopies;
+    for (ScheduleTriplet triplet : schedule.triplets) {
+      if (!computeSliceTouchesAlloc(triplet.alloc))
+        continue;
+      refinedTriplets.push_back(triplet);
+      refinedAllocs.insert(triplet.alloc.getOperation());
+      refinedPreloadCopies.insert(triplet.load.getOperation());
+    }
+    if (refinedTriplets.empty())
+      return false;
+    schedule.triplets = std::move(refinedTriplets);
+    tileAllocs = std::move(refinedAllocs);
+    preloadCopies = std::move(refinedPreloadCopies);
+    return true;
+  }
+
+  bool collectCopyOuts() {
+    Block *forBody = forOp.getBody();
+    for (Operation &op : forBody->without_terminator()) {
+      auto copy = dyn_cast<memref::CopyOp>(&op);
+      if (!copy)
+        continue;
+      auto sourceAlloc = findBaseAlloc(copy.getSource());
+      if (!sourceAlloc || !tileAllocs.contains(sourceAlloc.getOperation()))
+        continue;
+      auto targetAlloc = findBaseAlloc(copy.getTarget());
+      if (targetAlloc && tileAllocs.contains(targetAlloc.getOperation()))
+        continue;
+      schedule.stores.push_back(copy);
+    }
+
+    return !schedule.stores.empty();
+  }
+
+  bool collectStoreSlices() {
+    BackwardSliceOptions options;
+    options.omitUsesFromAbove = false;
+    options.filter = [&](Operation *op) {
+      return op->getBlock() == forOp.getBody() || forOp->isAncestor(op);
+    };
+
+    for (memref::CopyOp store : schedule.stores) {
+      if (failed(getBackwardSlice(store.getSource(), &storeBackwardSlice,
+                                  options)))
+        return false;
+      if (failed(getBackwardSlice(store.getTarget(), &storeBackwardSlice,
+                                  options)))
+        return false;
+    }
+    return true;
+  }
+
+  bool collectComputeSlice() {
+    Block *forBody = forOp.getBody();
+    for (Operation &op : forBody->without_terminator()) {
+      bool inStoreSlice = storeBackwardSlice.contains(&op);
+      if (auto copy = dyn_cast<memref::CopyOp>(&op)) {
+        if (preloadCopies.contains(copy.getOperation()) ||
+            llvm::any_of(schedule.stores, [&](memref::CopyOp store) {
+              return isSameCopy(store, copy);
+            }))
+          continue;
+        auto sourceAlloc = findBaseAlloc(copy.getSource());
+        auto targetAlloc = findBaseAlloc(copy.getTarget());
+        if (sourceAlloc && tileAllocs.contains(sourceAlloc.getOperation()) &&
+            (!targetAlloc || !tileAllocs.contains(targetAlloc.getOperation())))
+          continue;
+        if (opTouchesTileBuffer(&op))
+          return false;
+        continue;
+      }
+
+      bool touchesTile = opTouchesTileBuffer(&op);
+      if (!touchesTile && !inStoreSlice)
+        continue;
+
+      if (!isSupportedCompute(&op)) {
+        if (isAllowedLocalUtilityOp(&op))
+          continue;
+        return false;
+      }
+
+      if (isa<scf::ForOp>(&op) && !verifiedTiledGenericParallel)
+        return false;
+      schedule.computeOps.push_back(&op);
+    }
+
+    return !schedule.computeOps.empty();
+  }
+
+  bool validateScheduleOrder() {
+    Operation *firstCompute = schedule.computeOps.front();
+    Operation *lastCompute = schedule.computeOps.back();
+    for (auto triplet : schedule.triplets) {
+      if (!triplet.load->isBeforeInBlock(firstCompute))
+        return false;
+    }
+    for (memref::CopyOp store : schedule.stores) {
+      if (!lastCompute->isBeforeInBlock(store))
+        return false;
+    }
+    return true;
+  }
+
+  bool run() {
+    return collectCopyIns() && collectComputeSlice() &&
+           refineCopyInsToComputeUsedBuffers() && collectCopyOuts() &&
+           collectStoreSlices() && validateScheduleOrder();
+  }
+};
+
 // Generate the ping or pong region IR of the double-buffered loop.
 void generatePingPongSubKernel(IRRewriter &rewriter,
                                SingleBufferSchedule &schedule,
@@ -147,14 +402,14 @@ void generatePingPongSubKernel(IRRewriter &rewriter,
                               forOp.getBody());
   }
 
-  // Re-map the compute.
+  // Re-map the compute slice.
   rewriter.setInsertionPointAfter(ifNotLastIter);
   IRMapping mapping2;
   mapping2.map(indVar, newDBLoopIndVar);
   for (auto i = 0; i < schedule.triplets.size(); ++i)
     mapping2.map(schedule.triplets[i].alloc, thisBuffers[i]);
-  Operation *newComputeOp = schedule.compute->clone(mapping2);
-  rewriter.insert(newComputeOp);
+  for (Operation *compute : schedule.computeOps)
+    cloneOpWithMappedSlices(compute, rewriter, mapping2, forOp.getBody());
 
   // Store the results.
   for (auto i = 0; i < schedule.stores.size(); ++i) {
@@ -277,7 +532,8 @@ void rewriteAsDoubleBuffered(IRRewriter &rewriter, scf::ForOp sbForOp,
 
 // State machine to parse the `tiled_generic`.
 bool generateSchedule(IRRewriter &rewriter, scf::ForOp forOp,
-                      SingleBufferSchedule &schedule) {
+                      SingleBufferSchedule &schedule,
+                      AliasAnalysis &aliasAnalysis) {
   if (!forOp.getInitArgs().empty())
     return false;
   schedule.forOp = forOp;
@@ -286,48 +542,9 @@ bool generateSchedule(IRRewriter &rewriter, scf::ForOp forOp,
   if (forOp->hasAttr("tiled_generic") && forOp->hasAttr("all_parallel"))
     verifiedTiledGenericParallel = true;
 
-  Block *forBody = forOp.getBody();
-  for (Operation &op : forBody->without_terminator()) {
-    if (!isSupportedCompute(&op))
-      continue;
-    if (isa<scf::ForOp>(&op) && !verifiedTiledGenericParallel)
-      continue;
-    schedule.compute = &op;
-    break;
-  }
-  if (!schedule.compute)
-    return false;
-
-  llvm::SmallDenseSet<Operation *> tileAllocs;
-  for (Operation &op : forBody->without_terminator()) {
-    auto copy = dyn_cast<memref::CopyOp>(&op);
-    if (!copy || !copy->isBeforeInBlock(schedule.compute))
-      continue;
-    auto alloc = findBaseAlloc(copy.getTarget());
-    if (!alloc || alloc->getBlock() != forBody ||
-        !alloc->isBeforeInBlock(copy))
-      continue;
-    schedule.triplets.push_back({alloc, copy});
-    tileAllocs.insert(alloc.getOperation());
-  }
-
-  if (schedule.triplets.empty())
-    return false;
-
-  for (Operation &op : forBody->without_terminator()) {
-    auto copy = dyn_cast<memref::CopyOp>(&op);
-    if (!copy || !schedule.compute->isBeforeInBlock(copy))
-      continue;
-    auto sourceAlloc = findBaseAlloc(copy.getSource());
-    auto targetAlloc = findBaseAlloc(copy.getTarget());
-    if (!sourceAlloc || !tileAllocs.contains(sourceAlloc.getOperation()))
-      continue;
-    if (targetAlloc && tileAllocs.contains(targetAlloc.getOperation()))
-      continue;
-    schedule.stores.push_back(copy);
-  }
-
-  return !schedule.stores.empty();
+  TileDataflowAnalysis analysis{aliasAnalysis, forOp, schedule,
+                                verifiedTiledGenericParallel};
+  return analysis.run();
 }
 
 // The concrete implementation of the DoubleBufferGenericS1 pass.
@@ -341,11 +558,13 @@ struct HexagonDoubleBufferGenericS1Pass
   void runOnOperation() override {
     int uniqueID = 0; // for each double-buffered linalg-generic.
     auto func = getOperation();
+    auto &aliasAnalysis = getAnalysis<AliasAnalysis>();
 
-    func.walk([&uniqueID](scf::ForOp forOp) {
+    func.walk([&uniqueID, &aliasAnalysis](scf::ForOp forOp) {
       SingleBufferSchedule schedule;
       IRRewriter rewriter(forOp.getContext());
-      bool viableCandidate = generateSchedule(rewriter, forOp, schedule);
+      bool viableCandidate =
+          generateSchedule(rewriter, forOp, schedule, aliasAnalysis);
       if (viableCandidate)
         rewriteAsDoubleBuffered(rewriter, forOp, schedule, uniqueID);
       return WalkResult::advance();

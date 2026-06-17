@@ -61,6 +61,7 @@ add_mlir_library(Transforms
 #        HexagonCommon
 #        HexagonMem
   MLIRArithDialect
+  MLIRAnalysis
   MLIRDialectUtils
   MLIRIR
   MLIRMathDialect

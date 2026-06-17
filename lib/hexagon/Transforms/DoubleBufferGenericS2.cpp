@@ -62,7 +62,7 @@ namespace {
 /// To parse the state of double-buffered graph IR.
 struct KernelSchedule {
   scf::IfOp prefetch;
-  Operation *compute;
+  SmallVector<Operation *> computeOps;
   SmallVector<memref::CopyOp> stores;
 };
 struct DBSchedule {
@@ -238,29 +238,25 @@ bool extractPreFetch(scf::IfOp kernel, KernelSchedule &schedule) {
   return true;
 }
 
-// Extract the store-back after kernel (ping or pong) compute.
+bool isSupportedCompute(Operation *op) {
+  return isa<linalg::LinalgOp, scf::ForOp, scf::ForallOp>(op);
+}
+
+// Extract the store-back after kernel (ping or pong) compute slice.
 bool extractStoreBack(scf::IfOp kernel, KernelSchedule &schedule) {
   // schedule.prefetch is already set by extractPreFetch
   if (!schedule.prefetch)
     return false;
 
-  Operation *compute = schedule.prefetch->getNextNode();
-  if (!compute)
-    return false;
-
-  if (!isa<linalg::LinalgOp>(compute) && !isa<scf::ForOp>(compute) &&
-      !isa<scf::ForallOp>(compute))
-    return false;
-  schedule.compute = compute;
-
-  // After compute, collect memref::CopyOp till the yield
-  Operation *currentOp = compute->getNextNode();
+  Operation *currentOp = schedule.prefetch->getNextNode();
   while (currentOp) {
     if (auto copyOp = dyn_cast<memref::CopyOp>(currentOp))
       schedule.stores.push_back(copyOp);
+    else if (isSupportedCompute(currentOp))
+      schedule.computeOps.push_back(currentOp);
     currentOp = currentOp->getNextNode();
   }
-  if (schedule.stores.size() == 0)
+  if (schedule.computeOps.empty() || schedule.stores.empty())
     return false;
   return true;
 }
