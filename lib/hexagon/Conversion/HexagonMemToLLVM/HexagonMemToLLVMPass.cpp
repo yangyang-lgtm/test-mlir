@@ -667,8 +667,8 @@ void populateHexagonMemToLLVMConversionPatterns(LLVMTypeConverter &converter,
 
 struct HexagonMemToLLVMPass
     : public ::impl::HexagonMemToLLVMBase<HexagonMemToLLVMPass> {
-  explicit HexagonMemToLLVMPass(const HexagonMemToLLVMOptions &options)
-      : Base(options) {}
+  // explicit HexagonMemToLLVMPass(const HexagonMemToLLVMOptions &options)
+  //     : Base(options) {}
 
   using Base::Base;
 

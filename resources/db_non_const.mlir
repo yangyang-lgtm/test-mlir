@@ -16,22 +16,19 @@ module {
       %subview = memref.subview %reinterpret_cast[0] [%6] [1] : memref<128xf32, strided<[1], offset: ?>> to memref<?xf32, strided<[1], offset: ?>>
       %subview_0 = memref.subview %alloc[0] [%6] [1] : memref<128xf32> to memref<?xf32, strided<[1]>>
       memref.copy %subview, %subview_0 : memref<?xf32, strided<[1], offset: ?>> to memref<?xf32, strided<[1]>>
-      %7 = bufferization.to_tensor %alloc restrict writable : memref<128xf32> to tensor<128xf32>
       %reinterpret_cast_1 = memref.reinterpret_cast %arg1 to offset: [%1], sizes: [128], strides: [1] : memref<*xf32> to memref<128xf32, strided<[1], offset: ?>>
       %alloc_2 = memref.alloc() : memref<128xf32>
       %subview_3 = memref.subview %reinterpret_cast_1[0] [%6] [1] : memref<128xf32, strided<[1], offset: ?>> to memref<?xf32, strided<[1], offset: ?>>
       %subview_4 = memref.subview %alloc_2[0] [%6] [1] : memref<128xf32> to memref<?xf32, strided<[1]>>
       memref.copy %subview_3, %subview_4 : memref<?xf32, strided<[1], offset: ?>> to memref<?xf32, strided<[1]>>
-      %8 = bufferization.to_tensor %alloc_2 restrict writable : memref<128xf32> to tensor<128xf32>
-      %9 = linalg.generic {indexing_maps = [#map, #map, #map], iterator_types = ["parallel"]} ins(%7, %8 : tensor<128xf32>, tensor<128xf32>) outs(%7 : tensor<128xf32>) {
+      linalg.generic {indexing_maps = [#map, #map, #map], iterator_types = ["parallel"]} ins(%alloc, %alloc_2 : memref<128xf32>, memref<128xf32>) outs(%alloc : memref<128xf32>) {
       ^bb0(%in: f32, %in_7: f32, %out: f32):
-        %10 = arith.addf %in, %in_7 : f32
-        linalg.yield %10 : f32
-      } -> tensor<128xf32>
+        %7 = arith.addf %in, %in_7 : f32
+        linalg.yield %7 : f32
+      }
       %reinterpret_cast_5 = memref.reinterpret_cast %arg2 to offset: [%1], sizes: [128], strides: [1] : memref<*xf32> to memref<128xf32, strided<[1], offset: ?>>
-      %extracted_slice = tensor.extract_slice %9[0] [%6] [1] : tensor<128xf32> to tensor<?xf32>
       %subview_6 = memref.subview %reinterpret_cast_5[0] [%6] [1] : memref<128xf32, strided<[1], offset: ?>> to memref<?xf32, strided<[1], offset: ?>>
-      bufferization.materialize_in_destination %extracted_slice in writable %subview_6 : (tensor<?xf32>, memref<?xf32, strided<[1], offset: ?>>) -> ()
+      memref.copy %subview_0, %subview_6 : memref<?xf32, strided<[1]>> to memref<?xf32, strided<[1], offset: ?>>
     } {all_parallel, tiled_generic}
     return
   }

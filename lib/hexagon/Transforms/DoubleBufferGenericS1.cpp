@@ -22,11 +22,11 @@
 
 #include "hexagon/Transforms/Passes.h"
 
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/Pass/Pass.h"
-#include <optional>
 
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Debug.h"
@@ -44,41 +44,10 @@ using namespace hexagon;
 
 namespace {
 
-/// Extract a constant `index` value from an SSA `Value`.
-static std::optional<int64_t> getIndexConstant(Value v) {
-  if (auto cOp = v.getDefiningOp<arith::ConstantOp>()) {
-    if (llvm::isa<mlir::IndexType>(cOp.getType())) {
-      if (auto intAttr = llvm::dyn_cast<mlir::IntegerAttr>(cOp.getValue()))
-        return intAttr.getInt(); // signed 64-bit
-    }
-  }
-  // Optional: peel a trivial index cast from an integer constant.
-  if (auto cast = v.getDefiningOp<arith::IndexCastOp>()) {
-    if (auto srcConst = cast.getIn().getDefiningOp<arith::ConstantOp>()) {
-      if (auto intAttr = llvm::dyn_cast<mlir::IntegerAttr>(srcConst.getValue()))
-        return intAttr.getInt();
-    }
-  }
-  return std::nullopt;
-}
-
-// Returns true if `forOp` is in `normal form` with
-// knowns bounds and deterministic size of fetches.
-bool isZeroBasedEvenlyDivisible(scf::ForOp forOp) {
-  auto lb = getIndexConstant(forOp.getLowerBound());
-  auto ub = getIndexConstant(forOp.getUpperBound());
-  auto st = getIndexConstant(forOp.getStep());
-  if (!lb || !ub || !st || *lb != 0 || *st == 0 || *ub % *st != 0)
-    return false;
-  return true;
-}
-
 /// Structs to parse and store the schedule.
-enum class ScheduleStage { View, Alloc, Copy, Compute, Store, Unknown };
 struct ScheduleTriplet {
-  memref::SubViewOp view;
   memref::AllocOp alloc;
-  memref::CopyOp copy;
+  memref::CopyOp load;
 };
 
 struct SingleBufferSchedule {
@@ -88,14 +57,61 @@ struct SingleBufferSchedule {
   SmallVector<memref::CopyOp> stores;
 };
 
-/// Utility to convert `value` to `index` type.
-Value convertToIndex(OpBuilder &builder, Location loc, Value value) {
-  if (value.getType().isIndex())
+bool isSupportedCompute(Operation *op) {
+  return isa<linalg::LinalgOp, scf::ForOp, scf::ForallOp>(op);
+}
+
+memref::AllocOp findBaseAlloc(Value value) {
+  while (true) {
+    if (auto alloc = value.getDefiningOp<memref::AllocOp>())
+      return alloc;
+    if (auto subview = value.getDefiningOp<memref::SubViewOp>()) {
+      value = subview.getSource();
+      continue;
+    }
+    if (auto cast = value.getDefiningOp<memref::CastOp>()) {
+      value = cast.getSource();
+      continue;
+    }
+    if (auto reinterpret = value.getDefiningOp<memref::ReinterpretCastOp>()) {
+      value = reinterpret.getSource();
+      continue;
+    }
+    return nullptr;
+  }
+}
+
+bool isDefinedInBlockBefore(Operation *op, Block *block, Operation *limit) {
+  return op && op->getBlock() == block && op->isBeforeInBlock(limit);
+}
+
+Value cloneValueSlice(Value value, IRRewriter &rewriter, IRMapping &mapping,
+                      Block *sourceBlock, Operation *limit) {
+  if (Value mapped = mapping.lookupOrNull(value))
+    return mapped;
+
+  auto *def = value.getDefiningOp();
+  if (!isDefinedInBlockBefore(def, sourceBlock, limit))
     return value;
-  auto indexType = builder.getIndexType();
-  auto indexValue =
-      mlir::arith::IndexCastOp::create(builder, loc, indexType, value);
-  return indexValue;
+
+  for (Value operand : def->getOperands())
+    cloneValueSlice(operand, rewriter, mapping, sourceBlock, limit);
+
+  Operation *cloned = def->clone(mapping);
+  rewriter.insert(cloned);
+  mapping.map(def->getResults(), cloned->getResults());
+  return mapping.lookup(value);
+}
+
+memref::CopyOp cloneCopyWithMappedSlices(memref::CopyOp copy,
+                                         IRRewriter &rewriter,
+                                         IRMapping &mapping,
+                                         Block *sourceBlock) {
+  Value source = cloneValueSlice(copy.getSource(), rewriter, mapping,
+                                 sourceBlock, copy);
+  Value target = cloneValueSlice(copy.getTarget(), rewriter, mapping,
+                                 sourceBlock, copy);
+  return memref::CopyOp::create(rewriter, copy.getLoc(), source, target);
 }
 
 // Generate the ping or pong region IR of the double-buffered loop.
@@ -126,11 +142,9 @@ void generatePingPongSubKernel(IRRewriter &rewriter,
   for (auto i = 0; i < schedule.triplets.size(); ++i) {
     IRMapping mapping;
     mapping.map(indVar, nextIdx);
-    auto view = schedule.triplets[i].view;
-    Operation *newViewOp = view->clone(mapping);
-    rewriter.insert(newViewOp);
-    Value cloneResult = newViewOp->getResult(0);
-    memref::CopyOp::create(rewriter, loc, cloneResult, nextBuffers[i]);
+    mapping.map(schedule.triplets[i].alloc, nextBuffers[i]);
+    cloneCopyWithMappedSlices(schedule.triplets[i].load, rewriter, mapping,
+                              forOp.getBody());
   }
 
   // Re-map the compute.
@@ -143,18 +157,9 @@ void generatePingPongSubKernel(IRRewriter &rewriter,
   rewriter.insert(newComputeOp);
 
   // Store the results.
-  for (auto i = 0; i < schedule.triplets.size(); ++i) {
-    IRMapping mapping;
-    mapping.map(indVar, newDBLoopIndVar);
-    auto view = schedule.triplets[i].view;
-    Operation *newViewOp = view->clone(mapping);
-    rewriter.insert(newViewOp);
-    Value cloneResult = newViewOp->getResult(0);
-    mapping2.map(view, cloneResult);
-  }
   for (auto i = 0; i < schedule.stores.size(); ++i) {
-    Operation *newStore = schedule.stores[i]->clone(mapping2);
-    rewriter.insert(newStore);
+    cloneCopyWithMappedSlices(schedule.stores[i], rewriter, mapping2,
+                              forOp.getBody());
   }
   memref::StoreOp::create(rewriter, loc, toggleNextStoreValue, toggle,
                           ValueRange{});
@@ -200,16 +205,16 @@ void rewriteAsDoubleBuffered(IRRewriter &rewriter, scf::ForOp sbForOp,
   }
 
   // Get the bounds from the single-buffer original for-loop.
-  Value lowerBoundIdx = convertToIndex(rewriter, loc, sbForOp.getLowerBound());
-  Value upperBoundIdx = convertToIndex(rewriter, loc, sbForOp.getUpperBound());
-  Value stepIdx = convertToIndex(rewriter, loc, sbForOp.getStep());
+  Value lowerBound = sbForOp.getLowerBound();
+  Value upperBound = sbForOp.getUpperBound();
+  Value step = sbForOp.getStep();
   auto indVar = sbForOp.getInductionVar();
   auto idAttr = mlir::IntegerAttr::get(rewriter.getI64Type(), uid++);
 
   // Prologue: executes iff not 0-iteration loop.
   Value mayLoop =
       arith::CmpIOp::create(rewriter, loc, mlir::arith::CmpIPredicate::slt,
-                            lowerBoundIdx, upperBoundIdx)
+                            lowerBound, upperBound)
           .getResult();
   Value mayLoopVar = memref::AllocOp::create(rewriter, loc, boolMemrefType);
   memref::StoreOp::create(rewriter, loc, mayLoop, mayLoopVar, ValueRange{});
@@ -222,19 +227,17 @@ void rewriteAsDoubleBuffered(IRRewriter &rewriter, scf::ForOp sbForOp,
   rewriter.setInsertionPointToStart(&ifMayLoop.getThenRegion().front());
   for (auto i = 0; i < schedule.triplets.size(); ++i) {
     IRMapping mapping;
-    mapping.map(indVar, lowerBoundIdx);
-    auto view = schedule.triplets[i].view;
-    Operation *newViewOp = view->clone(mapping);
-    rewriter.insert(newViewOp);
-    Value cloneResult = newViewOp->getResult(0);
-    memref::CopyOp::create(rewriter, loc, cloneResult, pingBuffers[i]);
+    mapping.map(indVar, lowerBound);
+    mapping.map(schedule.triplets[i].alloc, pingBuffers[i]);
+    cloneCopyWithMappedSlices(schedule.triplets[i].load, rewriter, mapping,
+                              sbForOp.getBody());
   }
 
   // Kernel: create the new double-buffered top-loop.
   rewriter.setInsertionPoint(sbForOp);
   scf::LoopNest loopNest = scf::buildLoopNest(
-      rewriter, loc, SmallVector<Value>{lowerBoundIdx},
-      SmallVector<Value>{upperBoundIdx}, SmallVector<Value>{stepIdx});
+      rewriter, loc, SmallVector<Value>{lowerBound},
+      SmallVector<Value>{upperBound}, SmallVector<Value>{step});
   loopNest.loops.back()->setAttr("db_generic", idAttr);
   Block *forBody = loopNest.loops.back().getBody();
   Value dbIndVar = loopNest.loops.back().getInductionVar();
@@ -245,12 +248,10 @@ void rewriteAsDoubleBuffered(IRRewriter &rewriter, scf::ForOp sbForOp,
 
   // Check if next preload should happen (or this is last iteration).
   Value nextIdx =
-      arith::AddIOp::create(rewriter, loc, dbIndVar, stepIdx).getResult();
-  Value nextIdxPlusTileSize =
-      arith::AddIOp::create(rewriter, loc, nextIdx, stepIdx).getResult();
+      arith::AddIOp::create(rewriter, loc, dbIndVar, step).getResult();
   Value nextExists =
-      arith::CmpIOp::create(rewriter, loc, mlir::arith::CmpIPredicate::sle,
-                            nextIdxPlusTileSize, upperBoundIdx)
+      arith::CmpIOp::create(rewriter, loc, mlir::arith::CmpIPredicate::slt,
+                            nextIdx, upperBound)
           .getResult();
 
   // Ping sub-kernel.
@@ -285,67 +286,48 @@ bool generateSchedule(IRRewriter &rewriter, scf::ForOp forOp,
   if (forOp->hasAttr("tiled_generic") && forOp->hasAttr("all_parallel"))
     verifiedTiledGenericParallel = true;
 
-  if (!isZeroBasedEvenlyDivisible(forOp))
+  Block *forBody = forOp.getBody();
+  for (Operation &op : forBody->without_terminator()) {
+    if (!isSupportedCompute(&op))
+      continue;
+    if (isa<scf::ForOp>(&op) && !verifiedTiledGenericParallel)
+      continue;
+    schedule.compute = &op;
+    break;
+  }
+  if (!schedule.compute)
     return false;
 
-  Block *forBody = forOp.getBody();
-  ScheduleTriplet triplet;
-  ScheduleStage stage = ScheduleStage::View;
-  for (size_t i = 0; i < forBody->getOperations().size(); i++) {
-    Operation &op = *std::next(forBody->begin(), i);
-    switch (stage) {
-    case ScheduleStage::View: {
-      auto viewOp = llvm::dyn_cast<memref::SubViewOp>(op);
-      if (!viewOp) {
-        if (schedule.triplets.empty())
-          return false;
-        if (llvm::isa<scf::ForallOp>(op) ||
-            (llvm::isa<scf::ForOp>(op) && verifiedTiledGenericParallel)) {
-          schedule.compute = &op;
-          stage = ScheduleStage::Store;
-          break;
-        }
-        return false;
-      }
-      triplet.view = viewOp;
-      stage = ScheduleStage::Alloc;
-      break;
-    }
-    case ScheduleStage::Alloc: {
-      auto allocOp = llvm::dyn_cast<memref::AllocOp>(op);
-      if (!allocOp)
-        return false;
-      triplet.alloc = allocOp;
-      stage = ScheduleStage::Copy;
-      break;
-    }
-    case ScheduleStage::Copy: {
-      auto copyOp = llvm::dyn_cast<memref::CopyOp>(op);
-      if (!copyOp)
-        return false;
-      triplet.copy = copyOp;
-      schedule.triplets.push_back(triplet);
-      stage = ScheduleStage::View;
-      break;
-    }
-    case ScheduleStage::Store: {
-      if (llvm::dyn_cast<scf::YieldOp>(op)) {
-        if (schedule.stores.empty())
-          return false;
-        return true; // done!
-      }
-      auto copyOp = llvm::dyn_cast<memref::CopyOp>(op);
-      // TODO: more checks about what is being stored.
-      if (!copyOp)
-        return false;
-      schedule.stores.push_back(copyOp);
-      break;
-    }
-    default:
-      return false;
-    } // switch
-  }   // for
-  return false;
+  llvm::SmallDenseSet<Operation *> tileAllocs;
+  for (Operation &op : forBody->without_terminator()) {
+    auto copy = dyn_cast<memref::CopyOp>(&op);
+    if (!copy || !copy->isBeforeInBlock(schedule.compute))
+      continue;
+    auto alloc = findBaseAlloc(copy.getTarget());
+    if (!alloc || alloc->getBlock() != forBody ||
+        !alloc->isBeforeInBlock(copy))
+      continue;
+    schedule.triplets.push_back({alloc, copy});
+    tileAllocs.insert(alloc.getOperation());
+  }
+
+  if (schedule.triplets.empty())
+    return false;
+
+  for (Operation &op : forBody->without_terminator()) {
+    auto copy = dyn_cast<memref::CopyOp>(&op);
+    if (!copy || !schedule.compute->isBeforeInBlock(copy))
+      continue;
+    auto sourceAlloc = findBaseAlloc(copy.getSource());
+    auto targetAlloc = findBaseAlloc(copy.getTarget());
+    if (!sourceAlloc || !tileAllocs.contains(sourceAlloc.getOperation()))
+      continue;
+    if (targetAlloc && tileAllocs.contains(targetAlloc.getOperation()))
+      continue;
+    schedule.stores.push_back(copy);
+  }
+
+  return !schedule.stores.empty();
 }
 
 // The concrete implementation of the DoubleBufferGenericS1 pass.

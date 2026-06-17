@@ -134,7 +134,7 @@ int main(int argc, char **argv) {
   {
     // bufferization
     manager.addPass(mlir::bufferization::createEmptyTensorEliminationPass());
-    // manager.addNestedPass<mlir::func::FuncOp>(mlir::hexagon::createEraseVectorToTensorWritebackPass());
+    manager.addNestedPass<mlir::func::FuncOp>(mlir::hexagon::createEraseVectorToTensorWritebackPass());
 
     mlir::bufferization::OneShotBufferizePassOptions passOpts;
     passOpts.bufferizeFunctionBoundaries = true;
@@ -146,15 +146,15 @@ int main(int argc, char **argv) {
     manager.addNestedPass<mlir::func::FuncOp>(mlir::hexagon::createHexagonDoubleBufferGenericS1Pass());
     manager.addNestedPass<mlir::func::FuncOp>(mlir::bufferization::createBufferLoopHoistingPass());
 
-    // manager.addNestedPass<mlir::func::FuncOp>(mlir::hexagon::createCopyCanonicalizationPass());
+    manager.addNestedPass<mlir::func::FuncOp>(mlir::hexagon::createCopyCanonicalizationPass());
     manager.addPass(mlir::createCanonicalizerPass());
 
     mlir::bufferization::buildBufferDeallocationPipeline(
         manager, mlir::bufferization::BufferDeallocationPipelineOptions{});
     manager.addPass(mlir::createCSEPass());
 
-    // manager.addNestedPass<mlir::func::FuncOp>(mlir::hexagon::createHexagonDoubleBufferGenericS2Pass());
-    // manager.addNestedPass<mlir::func::FuncOp>(mlir::hexagon::createConvertZeroSizeMemrefPass());
+    manager.addNestedPass<mlir::func::FuncOp>(mlir::hexagon::createHexagonDoubleBufferGenericS2Pass());
+    manager.addNestedPass<mlir::func::FuncOp>(mlir::hexagon::createConvertZeroSizeMemrefPass());
     manager.addPass(mlir::createConvertBufferizationToMemRefPass());
   }
 

@@ -15,6 +15,7 @@
 #include "hexagon/Conversion/LinalgToLLVM/LinalgToLLVM.h"
 #include "hexagon/Dialect/HexagonMem/IR/HexagonMemDialect.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/MemRef/Utils/MemRefUtils.h"
 #include "llvm/Support/Debug.h"
 
@@ -23,19 +24,10 @@ namespace hexagon {
 
 namespace {
 
-/// Returns true if `type` is statically shaped 2D memref.
+/// Returns true if `type` is a ranked memref that this helper can lower.
 bool isSafe(Type type) {
   auto memRefType = dyn_cast<MemRefType>(type);
-  if (!memRefType || memRefType.getRank() > 2)
-    return false;
-  return llvm::count_if(memRefType.getShape(), ShapedType::isDynamic) == 0;
-}
-
-/// Returns memory address assuming provided type is memref.
-unsigned getMemorySpace(Type type) {
-  auto memRefType = dyn_cast<MemRefType>(type);
-  assert(memRefType && "expected  memref type");
-  return memRefType.getMemorySpaceAsInt();
+  return memRefType && memRefType.getRank() <= 2;
 }
 
 static Value getI32Const(Location loc, IRRewriter &rewriter, int val) {
@@ -47,7 +39,16 @@ Value createNumElements(Location loc, IRRewriter &rewriter, Value view) {
   auto viewType = view.getType();
   assert(isSafe(viewType) && "num elements cannot be created for unsafe type");
   auto memrefType = cast<MemRefType>(viewType);
-  return getI32Const(loc, rewriter, memrefType.getNumElements());
+  Value numElements = getI32Const(loc, rewriter, 1);
+  for (auto dim : llvm::enumerate(memrefType.getShape())) {
+    Value dimValue;
+    if (ShapedType::isDynamic(dim.value()))
+      dimValue = memref::DimOp::create(rewriter, loc, view, dim.index());
+    else
+      dimValue = getI32Const(loc, rewriter, dim.value());
+    numElements = arith::MulIOp::create(rewriter, loc, numElements, dimValue);
+  }
+  return numElements;
 }
 
 bool createDMAStartOp(Location loc, IRRewriter &rewriter, Value source,
@@ -55,12 +56,13 @@ bool createDMAStartOp(Location loc, IRRewriter &rewriter, Value source,
   auto sourceType = source.getType();
   auto targetType = target.getType();
 
-  if (!isSafe(sourceType) || !isSafe(targetType) ||
-      getMemorySpace(sourceType) == getMemorySpace(targetType))
+  if (!isSafe(sourceType) || !isSafe(targetType))
     return false;
 
   MemRefType sourceMemRefType = cast<MemRefType>(sourceType);
   MemRefType targetMemRefType = cast<MemRefType>(targetType);
+  if (sourceMemRefType.getRank() != targetMemRefType.getRank())
+    return false;
   int64_t rank = sourceMemRefType.getRank();
 
   // Create zero index for tag access
@@ -84,10 +86,9 @@ bool createDMAStartOp(Location loc, IRRewriter &rewriter, Value source,
       !(isMemorySpaceIntTypeOrDefault(targetMemRefType, targetMemSpace)))
     return false;
 
-  Value numElements =
-      getI32Const(loc, rewriter, sourceMemRefType.getNumElements());
-  if (isContiguousMemrefType(sourceMemRefType) &&
-      isContiguousMemrefType(targetMemRefType)) {
+  Value numElements = createNumElements(loc, rewriter, source);
+  if (rank == 1 || (isContiguousMemrefType(sourceMemRefType) &&
+                    isContiguousMemrefType(targetMemRefType))) {
 
     memref::DmaStartOp::create(rewriter, loc, source, zeroIndices, target,
                                zeroIndices, numElements, tagAlloc, zeroIndex);
