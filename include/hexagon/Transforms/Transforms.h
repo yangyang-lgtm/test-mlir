@@ -24,6 +24,9 @@ std::unique_ptr<Pass> createCollapseAddressSpacePass();
 std::unique_ptr<OperationPass<func::FuncOp>>
 createAnnotateMemrefCopyDirectionPass();
 
+std::unique_ptr<OperationPass<func::FuncOp>>
+createHoistDoubleBufferCopyInsPass();
+
 std::unique_ptr<OperationPass<func::FuncOp>> createCopyCanonicalizationPass();
 
 std::unique_ptr<OperationPass<func::FuncOp>>

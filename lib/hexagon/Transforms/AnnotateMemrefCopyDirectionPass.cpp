@@ -5,6 +5,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "hexagon/Transforms/CopyDirection.h"
 #include "hexagon/Transforms/Passes.h"
 #include "triton-shared/Conversion/MemorySpaces.h"
 
@@ -41,13 +42,12 @@ struct AnnotateMemrefCopyDirectionPass
       std::optional<StringRef> source = classifyMemorySpace(sourceType);
       std::optional<StringRef> target = classifyMemorySpace(targetType);
       if (!source || !target) {
-        copyOp->removeAttr("copy_direction");
+        copyOp->removeAttr(kCopyDirectionAttrName);
         return;
       }
 
-      std::string direction =
-          (llvm::Twine(*source) + "_to_" + *target).str();
-      copyOp->setAttr("copy_direction",
+      std::string direction = (llvm::Twine(*source) + "_to_" + *target).str();
+      copyOp->setAttr(kCopyDirectionAttrName,
                       StringAttr::get(copyOp.getContext(), direction));
     });
   }

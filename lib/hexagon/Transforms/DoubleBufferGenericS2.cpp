@@ -19,6 +19,7 @@
 #include "hexagon/Conversion/LinalgToLLVM/Common.h"
 #include "hexagon/Conversion/LinalgToLLVM/LinalgToLLVM.h"
 #include "hexagon/Dialect/HexagonMem/IR/HexagonMemDialect.h"
+#include "hexagon/Transforms/CopyDirection.h"
 #include "hexagon/Transforms/Passes.h"
 #include "hexagon/Transforms/Transforms.h"
 
@@ -72,13 +73,24 @@ struct DBSchedule {
   KernelSchedule pingSchedule, pongSchedule;
 };
 
+/// 同时校验 S1 写入的调度角色和原始 copy_direction。
+///
+/// prefetch 必须对应 global_to_shared，store 必须对应
+/// shared_to_global，使 S2 不需要再根据 copy 的位置猜测角色。
+bool hasCopyRoleAndDirection(memref::CopyOp copy, StringRef role,
+                             StringRef direction) {
+  auto roleAttr = copy->getAttrOfType<StringAttr>("db_copy_role");
+  auto directionAttr = copy->getAttrOfType<StringAttr>(kCopyDirectionAttrName);
+  return roleAttr && roleAttr.getValue() == role && directionAttr &&
+         directionAttr.getValue() == direction;
+}
+
 /// Insert dma_waits using provided tags and num-elements.
 void insertDMAWaits(Location loc, IRRewriter &rewriter, ArrayRef<Value> tags,
-                    ArrayRef<Value> tagIndex,
-                    ArrayRef<Value> numElementSlots) {
+                    ArrayRef<Value> tagIndex, ArrayRef<Value> numElementSlots) {
   for (int i = 0; i < tags.size(); ++i) {
-    Value numElements = memref::LoadOp::create(
-        rewriter, loc, numElementSlots[i], tagIndex);
+    Value numElements =
+        memref::LoadOp::create(rewriter, loc, numElementSlots[i], tagIndex);
     memref::DmaWaitOp::create(rewriter, loc, tags[i], tagIndex, numElements);
   }
 }
@@ -95,7 +107,9 @@ void replacePrefetchWithDMA(Location loc, IRRewriter &rewriter,
 
   // warning: Don't be tempted to do replaceOp within this loop.
   for (Operation &op : block) {
-    if (auto copyOp = dyn_cast<memref::CopyOp>(&op))
+    auto copyOp = dyn_cast<memref::CopyOp>(&op);
+    // 只将 S1 标记的 global -> shared 预取转换成异步 DMA。
+    if (copyOp && hasCopyRoleAndDirection(copyOp, "prefetch", kGlobalToShared))
       copies.push_back(copyOp);
   }
 
@@ -139,7 +153,9 @@ void rewriteAsDMATransfers(IRRewriter &rewriter, DBSchedule schedule) {
   assert(!thenRegion.empty() && thenRegion.getBlocks().size() == 1);
   Block &block = thenRegion.front();
   for (Operation &op : block) {
-    if (auto copyOp = dyn_cast<memref::CopyOp>(&op))
+    auto copyOp = dyn_cast<memref::CopyOp>(&op);
+    // prologue 中的 copy 使用 ping tag，并且必须是输入预取。
+    if (copyOp && hasCopyRoleAndDirection(copyOp, "prefetch", kGlobalToShared))
       preloads.push_back(copyOp);
   }
 
@@ -219,6 +235,12 @@ void rewriteAsDMATransfers(IRRewriter &rewriter, DBSchedule schedule) {
                         tagIndex);
   replaceStoreshWithDMA(loc, rewriter, schedule.pongSchedule, pongStoreWaits,
                         tagIndex);
+
+  // db_compute 只用于 S1/S2 之间传递调度信息，DMA 改写完成后清理。
+  for (Operation *compute : schedule.pingSchedule.computeOps)
+    compute->removeAttr("db_compute");
+  for (Operation *compute : schedule.pongSchedule.computeOps)
+    compute->removeAttr("db_compute");
 }
 
 /// Extract the prefetch section of ping-pong sub-kernels.
@@ -238,10 +260,6 @@ bool extractPreFetch(scf::IfOp kernel, KernelSchedule &schedule) {
   return true;
 }
 
-bool isSupportedCompute(Operation *op) {
-  return isa<linalg::LinalgOp, scf::ForOp, scf::ForallOp>(op);
-}
-
 // Extract the store-back after kernel (ping or pong) compute slice.
 bool extractStoreBack(scf::IfOp kernel, KernelSchedule &schedule) {
   // schedule.prefetch is already set by extractPreFetch
@@ -250,10 +268,13 @@ bool extractStoreBack(scf::IfOp kernel, KernelSchedule &schedule) {
 
   Operation *currentOp = schedule.prefetch->getNextNode();
   while (currentOp) {
-    if (auto copyOp = dyn_cast<memref::CopyOp>(currentOp))
-      schedule.stores.push_back(copyOp);
-    else if (isSupportedCompute(currentOp))
+    if (auto copyOp = dyn_cast<memref::CopyOp>(currentOp)) {
+      // 只收集 S1 标记的 shared -> global 结果回写。
+      if (hasCopyRoleAndDirection(copyOp, "store", kSharedToGlobal))
+        schedule.stores.push_back(copyOp);
+    } else if (currentOp->hasAttr("db_compute")) {
       schedule.computeOps.push_back(currentOp);
+    }
     currentOp = currentOp->getNextNode();
   }
   if (schedule.computeOps.empty() || schedule.stores.empty())

@@ -145,6 +145,8 @@ int main(int argc, char **argv) {
 
     manager.addNestedPass<mlir::func::FuncOp>(
         mlir::hexagon::createAnnotateMemrefCopyDirectionPass());
+    manager.addNestedPass<mlir::func::FuncOp>(
+        mlir::hexagon::createHoistDoubleBufferCopyInsPass());
     manager.addNestedPass<mlir::func::FuncOp>(mlir::hexagon::createHexagonDoubleBufferGenericS1Pass());
     manager.addNestedPass<mlir::func::FuncOp>(mlir::bufferization::createBufferLoopHoistingPass());
 

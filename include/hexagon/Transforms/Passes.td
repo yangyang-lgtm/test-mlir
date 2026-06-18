@@ -45,6 +45,18 @@ def AnnotateMemrefCopyDirection :
        "hexagon::createAnnotateMemrefCopyDirectionPass()";
 }
 
+def HoistDoubleBufferCopyIns :
+    Pass<"hoist-double-buffer-copy-ins", "func::FuncOp"> {
+  let summary = "Hoist legal double-buffer copy-ins before tile computation";
+  let description = [{
+    Moves `global_to_shared` memref.copy operations and their pure address
+    calculation slices before the first tile computation when memory
+    dependencies prove that the move is legal.
+  }];
+  let constructor =
+       "hexagon::createHoistDoubleBufferCopyInsPass()";
+}
+
 def ConvertLayout : Pass<"convert-layout", "func::FuncOp"> {
   let summary = "Convert hexagonmem::ConvertLayoutOp to linalg::GenericOp";
   let constructor = "hexagon::createConvertLayoutPass()";

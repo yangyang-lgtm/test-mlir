@@ -2,9 +2,11 @@ cmake_minimum_required(VERSION 3.20)
 
 project(custom CXX C)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_INCLUDE_CURRENT_DIR ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fcoroutines>)
+
 set(AIR_ENABLE_AIE ON)
 set(LLVM_BUILD_PATH "/home/yaoshi16ultra/workspace/llvm-project/build")
 set(LLVM_LIBRARY_DIR "${LLVM_BUILD_PATH}/lib")
@@ -142,8 +144,13 @@ set(TRITON_LIBRARIES
         MLIRRegisterAllDialects
 )
 
+include_directories("/home/yaoshi16ultra/workspace/concurrencpp/include")
+link_directories("/home/yaoshi16ultra/workspace/concurrencpp/build/lib")
+
 add_executable(${PROJECT_NAME} main.cpp)
+
 target_link_libraries(
         ${PROJECT_NAME} PRIVATE
         ${TRITON_LIBRARIES}
+        concurrencpp
 )

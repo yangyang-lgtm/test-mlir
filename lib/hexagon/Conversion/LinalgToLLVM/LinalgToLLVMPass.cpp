@@ -381,6 +381,8 @@ public:
       pm.addPass(createCanonicalizerPass());
 
       if (enableDoubleBuffering) {
+        pm.addNestedPass<func::FuncOp>(createAnnotateMemrefCopyDirectionPass());
+        pm.addNestedPass<func::FuncOp>(createHoistDoubleBufferCopyInsPass());
         pm.addNestedPass<func::FuncOp>(
             createHexagonDoubleBufferGenericS1Pass());
       }
