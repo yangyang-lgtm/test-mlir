@@ -9,6 +9,7 @@
 
 #include "triton-shared/Analysis/OpFoldResultUtils.h"
 #include "triton-shared/Conversion/StructuredToMemref/StructuredToMemref.h"
+#include "triton-shared/Conversion/MemorySpaces.h"
 #include "triton-shared/Dialect/TritonStructured/IR/TritonStructuredDialect.h"
 
 #include "mlir/IR/Builders.h"
@@ -759,7 +760,9 @@ private:
     auto elemType = tensorType.getElementType();
 
     auto alloc = memref::AllocOp::create(
-        rewriter, loc, MemRefType::get(tensorType.getShape(), elemType));
+        rewriter, loc,
+        MemRefType::get(tensorType.getShape(), elemType, AffineMap(),
+                        triton::kSharedMemorySpace));
 
     // No mask
     assert(!other && "other value used in non-masked load");
@@ -804,7 +807,9 @@ private:
     auto elemType = tensorType.getElementType();
 
     auto alloc = memref::AllocOp::create(
-        rewriter, loc, MemRefType::get(tensorType.getShape(), elemType));
+        rewriter, loc,
+        MemRefType::get(tensorType.getShape(), elemType, AffineMap(),
+                        triton::kSharedMemorySpace));
 
     SmallVector<OpFoldResult> mixedDims = op.getMixedMaskDims();
 
@@ -883,7 +888,8 @@ private:
     // Create alloc to save the result.
     auto resultType = dyn_cast<RankedTensorType>(op.getResult().getType());
     auto allocType =
-        MemRefType::get(resultType.getShape(), resultType.getElementType());
+        MemRefType::get(resultType.getShape(), resultType.getElementType(),
+                        AffineMap(), triton::kSharedMemorySpace);
     auto alloc = memref::AllocOp::create(rewriter, loc, allocType);
 
     auto allocStrides = mlir::getMixedValues(

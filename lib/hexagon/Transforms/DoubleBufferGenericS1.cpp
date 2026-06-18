@@ -128,7 +128,11 @@ memref::CopyOp cloneCopyWithMappedSlices(memref::CopyOp copy,
                                  sourceBlock, copy);
   Value target = cloneValueSlice(copy.getTarget(), rewriter, mapping,
                                  sourceBlock, copy);
-  return memref::CopyOp::create(rewriter, copy.getLoc(), source, target);
+  auto clonedCopy =
+      memref::CopyOp::create(rewriter, copy.getLoc(), source, target);
+  if (Attribute direction = copy->getAttr("copy_direction"))
+    clonedCopy->setAttr("copy_direction", direction);
+  return clonedCopy;
 }
 
 Operation *cloneOpWithMappedSlices(Operation *op, IRRewriter &rewriter,

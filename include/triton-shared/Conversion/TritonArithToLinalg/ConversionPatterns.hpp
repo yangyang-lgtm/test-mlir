@@ -12,6 +12,7 @@
 #include "triton-shared/Analysis/OpFoldResultUtils.h"
 #include "triton-shared/Analysis/PtrAnalysis.h"
 #include "triton-shared/Conversion/TritonArithToLinalg/ConversionTools.h"
+#include "triton-shared/Conversion/MemorySpaces.h"
 #include "triton-shared/Dialect/TritonTilingExt/IR/TritonTilingExtDialect.h"
 #include "triton-shared/Utils/Utils.h"
 
@@ -375,7 +376,9 @@ public:
     auto tensorType =
         RankedTensorType::get(type.getShape(), type.getElementType());
     auto alloc = memref::AllocOp::create(
-        rewriter, loc, MemRefType::get(type.getShape(), type.getElementType()));
+        rewriter, loc,
+        MemRefType::get(type.getShape(), type.getElementType(), AffineMap(),
+                        triton::kSharedMemorySpace));
 
     if (!mask) {
       assert(!other && "other value used in non-masked load");

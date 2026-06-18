@@ -34,6 +34,17 @@ def CopyCanonicalization :
        "hexagon::createCopyCanonicalizationPass()";
 }
 
+def AnnotateMemrefCopyDirection :
+    Pass<"annotate-memref-copy-direction", "func::FuncOp"> {
+  let summary = "Annotate memref.copy operations from operand memory spaces";
+  let description = [{
+    Adds a `copy_direction` string attribute to memref.copy operations.
+    Memory space 0 is classified as global and memory space 128 as shared.
+  }];
+  let constructor =
+       "hexagon::createAnnotateMemrefCopyDirectionPass()";
+}
+
 def ConvertLayout : Pass<"convert-layout", "func::FuncOp"> {
   let summary = "Convert hexagonmem::ConvertLayoutOp to linalg::GenericOp";
   let constructor = "hexagon::createConvertLayoutPass()";

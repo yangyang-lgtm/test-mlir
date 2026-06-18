@@ -1,4 +1,5 @@
 add_mlir_library(Transforms
+  AnnotateMemrefCopyDirectionPass.cpp
   DoubleBufferGenericS1.cpp
   DoubleBufferGenericS2.cpp
   Transforms.cpp
