@@ -45,6 +45,36 @@ def AnnotateMemrefCopyDirection :
        "hexagon::createAnnotateMemrefCopyDirectionPass()";
 }
 
+def SetTensorAllocSharedMemory :
+    Pass<"set-tensor-alloc-shared-memory", "func::FuncOp"> {
+  let summary = "Place all bufferized tensor allocations in shared memory";
+  let description = [{
+    Replaces every tensor.empty with bufferization.alloc_tensor and assigns
+    shared memory space 128 to all bufferization.alloc_tensor operations.
+    Run immediately before One-Shot Bufferize.
+  }];
+  let constructor =
+       "hexagon::createSetTensorAllocSharedMemoryPass()";
+}
+
+def PlanSharedMemory :
+    Pass<"plan-shared-memory", "func::FuncOp"> {
+  let summary = "Reuse memory space 128 allocations by lifetime";
+  let description = [{
+    Plans static identity-layout memref.alloc operations in shared memory space
+    128. Allocations with non-overlapping alias-aware live intervals reuse the
+    same byte ranges. The original allocations are replaced with memref.view
+    operations into one shared backing allocation.
+  }];
+  let options = [
+    Option<"bufferSize", "buffer-size", "int64_t", "1048576",
+           "Shared-memory capacity in bytes">,
+    Option<"alignment", "alignment", "int64_t", "64",
+           "Byte alignment for planned allocations">
+  ];
+  let constructor = "hexagon::createPlanSharedMemoryPass()";
+}
+
 def HoistDoubleBufferCopyIns :
     Pass<"hoist-double-buffer-copy-ins", "func::FuncOp"> {
   let summary = "Hoist legal double-buffer copy-ins before tile computation";
@@ -161,6 +191,19 @@ def HexagonDoubleBufferGenericS1 :
   }];
   let constructor =
        "hexagon::createHexagonDoubleBufferGenericS1Pass()";
+}
+
+def HexagonDoubleBufferReduceS1 :
+    InterfacePass<"hexagon-double-buffer-reduce-s1",
+                  "mlir::FunctionOpInterface"> {
+  let summary = "double buffer input tiles of accumulator reductions";
+  let description = [{
+    Software-pipelines reduction loops whose input tile is copied from global
+    memory into shared memory and whose accumulator buffer is allocated outside
+    the loop. This form has no per-iteration shared-to-global result copy.
+  }];
+  let constructor =
+       "hexagon::createHexagonDoubleBufferReduceS1Pass()";
 }
 
 def HexagonDoubleBufferGenericS2 :

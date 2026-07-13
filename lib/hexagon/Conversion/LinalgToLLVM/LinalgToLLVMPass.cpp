@@ -372,6 +372,8 @@ public:
       // Erase unnecessary vector-to-tensor writeback in loops before
       // bufferization.
       pm.addNestedPass<func::FuncOp>(createEraseVectorToTensorWritebackPass());
+      pm.addNestedPass<func::FuncOp>(
+          createSetTensorAllocSharedMemoryPass());
 
       mlir::bufferization::OneShotBufferizePassOptions passOpts;
       passOpts.bufferizeFunctionBoundaries = true;
@@ -383,6 +385,8 @@ public:
       if (enableDoubleBuffering) {
         pm.addNestedPass<func::FuncOp>(createAnnotateMemrefCopyDirectionPass());
         pm.addNestedPass<func::FuncOp>(createHoistDoubleBufferCopyInsPass());
+        pm.addNestedPass<func::FuncOp>(
+            createHexagonDoubleBufferReduceS1Pass());
         pm.addNestedPass<func::FuncOp>(
             createHexagonDoubleBufferGenericS1Pass());
       }
@@ -401,6 +405,7 @@ public:
         pm.addNestedPass<func::FuncOp>(
             createHexagonDoubleBufferGenericS2Pass());
       }
+      pm.addNestedPass<func::FuncOp>(createPlanSharedMemoryPass());
 
       // SCF Loop Unrolling of innermost loop after vectorization.
       if (enableSCFLoopUnroll) {

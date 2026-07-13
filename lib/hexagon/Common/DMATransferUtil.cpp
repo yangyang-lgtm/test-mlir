@@ -52,7 +52,7 @@ Value createNumElements(Location loc, IRRewriter &rewriter, Value view) {
 }
 
 bool createDMAStartOp(Location loc, IRRewriter &rewriter, Value source,
-                      Value target, Value tagAlloc) {
+                      Value target, Value tagAlloc, Operation **createdOp) {
   auto sourceType = source.getType();
   auto targetType = target.getType();
 
@@ -90,18 +90,23 @@ bool createDMAStartOp(Location loc, IRRewriter &rewriter, Value source,
   if (rank == 1 || (isContiguousMemrefType(sourceMemRefType) &&
                     isContiguousMemrefType(targetMemRefType))) {
 
-    memref::DmaStartOp::create(rewriter, loc, source, zeroIndices, target,
-                               zeroIndices, numElements, tagAlloc, zeroIndex);
+    auto dmaStart =
+        memref::DmaStartOp::create(rewriter, loc, source, zeroIndices, target,
+                                   zeroIndices, numElements, tagAlloc, zeroIndex);
+    if (createdOp)
+      *createdOp = dmaStart.getOperation();
     return true;
   }
 
   int64_t stride, width;
   assert(isStridedMultiDimMemrefType(sourceMemRefType, stride, width) ||
          isStridedMultiDimMemrefType(targetMemRefType, stride, width));
-  memref::DmaStartOp::create(rewriter, loc, source, zeroIndices, target,
-                             zeroIndices, numElements, tagAlloc, zeroIndex,
-                             getI32Const(loc, rewriter, stride),
-                             getI32Const(loc, rewriter, width));
+  auto dmaStart = memref::DmaStartOp::create(
+      rewriter, loc, source, zeroIndices, target, zeroIndices, numElements,
+      tagAlloc, zeroIndex, getI32Const(loc, rewriter, stride),
+      getI32Const(loc, rewriter, width));
+  if (createdOp)
+    *createdOp = dmaStart.getOperation();
   return true;
 }
 

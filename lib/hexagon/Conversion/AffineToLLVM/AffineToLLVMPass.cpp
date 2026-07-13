@@ -110,6 +110,7 @@ public:
 
     // One-Shot-Bufferize and related de-allocation.
     pm.addPass(bufferization::createEmptyTensorEliminationPass());
+    pm.addNestedPass<func::FuncOp>(createSetTensorAllocSharedMemoryPass());
     mlir::bufferization::OneShotBufferizePassOptions passOpts;
     passOpts.bufferizeFunctionBoundaries = true;
     passOpts.allowReturnAllocsFromLoops = true;

@@ -2052,19 +2052,19 @@ struct MinMaxConverter : public OpRewritePattern<CmpOp> {
 
 struct DenseConstantConverter : public OpConversionPattern<arith::ConstantOp> {
   using OpConversionPattern<arith::ConstantOp>::OpConversionPattern;
+
   LogicalResult
   matchAndRewrite(arith::ConstantOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     auto attr = cast<DenseElementsAttr>(op.getValue());
     auto loc = op.getLoc();
+    auto resultType = cast<RankedTensorType>(op.getResult().getType());
 
     auto splatConst = arith::ConstantOp::materialize(
         rewriter, attr.getSplatValue<Attribute>(), attr.getElementType(), loc);
 
-    auto init = tensor::EmptyOp::create(
-        rewriter, loc,
-        cast<RankedTensorType>(op.getResult().getType()).getShape(),
-        attr.getElementType());
+    Value init =
+        tensor::EmptyOp::create(rewriter, loc, resultType, ValueRange{});
 
     rewriter.replaceOpWithNewOp<linalg::FillOp>(op, ValueRange{splatConst},
                                                 ValueRange{init});

@@ -1,5 +1,7 @@
 add_mlir_library(Transforms
   AnnotateMemrefCopyDirectionPass.cpp
+  SetTensorAllocSharedMemoryPass.cpp
+  PlanSharedMemoryPass.cpp
   HoistDoubleBufferCopyInsPass.cpp
   DoubleBufferGenericS1.cpp
   DoubleBufferGenericS2.cpp

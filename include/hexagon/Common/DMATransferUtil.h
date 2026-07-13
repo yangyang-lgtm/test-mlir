@@ -22,7 +22,8 @@ Value createNumElements(Location loc, IRRewriter &rewriter, Value view);
 // from `source` to `target` memref using the specified tag.
 // Returns true if all checks pass and dma_start is created.
 bool createDMAStartOp(Location loc, IRRewriter &rewriter, Value source,
-                      Value target, Value tag);
+                      Value target, Value tag,
+                      Operation **createdOp = nullptr);
 
 } // namespace hexagon
 } // namespace mlir

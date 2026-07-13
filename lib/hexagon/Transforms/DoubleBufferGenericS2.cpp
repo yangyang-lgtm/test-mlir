@@ -69,8 +69,7 @@ struct KernelSchedule {
 struct DBSchedule {
   scf::IfOp prologue;
   scf::ForOp kernel;
-  scf::IfOp pingKernel, pongKernel;
-  KernelSchedule pingSchedule, pongSchedule;
+  KernelSchedule body;
 };
 
 /// 同时校验 S1 写入的调度角色和原始 copy_direction。
@@ -83,6 +82,18 @@ bool hasCopyRoleAndDirection(memref::CopyOp copy, StringRef role,
   auto directionAttr = copy->getAttrOfType<StringAttr>(kCopyDirectionAttrName);
   return roleAttr && roleAttr.getValue() == role && directionAttr &&
          directionAttr.getValue() == direction;
+}
+
+/// Create a DMA start for `copy` and preserve its transfer direction metadata.
+bool createDMAStartFromCopy(Location loc, IRRewriter &rewriter,
+                            memref::CopyOp copy, Value tag) {
+  Operation *dmaStart = nullptr;
+  if (!createDMAStartOp(loc, rewriter, copy.getSource(), copy.getTarget(), tag,
+                        &dmaStart))
+    return false;
+  if (Attribute direction = copy->getAttr(kCopyDirectionAttrName))
+    dmaStart->setAttr(kCopyDirectionAttrName, direction);
+  return true;
 }
 
 /// Insert dma_waits using provided tags and num-elements.
@@ -119,23 +130,21 @@ void replacePrefetchWithDMA(Location loc, IRRewriter &rewriter,
     Value numElements = createNumElements(loc, rewriter, copy.getSource());
     memref::StoreOp::create(rewriter, loc, numElements, numElementSlots[i],
                             tagIndex);
-    bool created = createDMAStartOp(loc, rewriter, copy.getSource(),
-                                    copy.getTarget(), tags[i]);
+    bool created = createDMAStartFromCopy(loc, rewriter, copy, tags[i]);
     assert(created && "unable to create dma_start");
     rewriter.eraseOp(copy);
   }
 }
 
-// Replace Stores with DMA Waits.
-void replaceStoreshWithDMA(Location loc, IRRewriter &rewriter,
-                           KernelSchedule &schedule, ArrayRef<Value> tags,
-                           ArrayRef<Value> tagIndex) {
+// Replace stores with a DMA start followed by its completion wait.
+void replaceStoresWithDMA(Location loc, IRRewriter &rewriter,
+                          KernelSchedule &schedule, ArrayRef<Value> tags,
+                          ArrayRef<Value> tagIndex) {
   for (int i = 0; i < schedule.stores.size(); ++i) {
     auto copy = schedule.stores[i];
     rewriter.setInsertionPoint(copy);
     Value numElements = createNumElements(loc, rewriter, copy.getSource());
-    bool created = createDMAStartOp(loc, rewriter, copy.getSource(),
-                                    copy.getTarget(), tags[i]);
+    bool created = createDMAStartFromCopy(loc, rewriter, copy, tags[i]);
     memref::DmaWaitOp::create(rewriter, loc, tags[i], tagIndex, numElements);
     rewriter.eraseOp(schedule.stores[i]);
   }
@@ -164,7 +173,7 @@ void rewriteAsDMATransfers(IRRewriter &rewriter, DBSchedule schedule) {
   Value zero = arith::ConstantIndexOp::create(rewriter, loc, 0);
   SmallVector<Value> tagIndex = {zero};
 
-  auto numStores = schedule.pingSchedule.stores.size();
+  auto numStores = schedule.body.stores.size();
 
   // Allocate tags.
   SmallVector<Value> pingWaits;
@@ -213,55 +222,64 @@ void rewriteAsDMATransfers(IRRewriter &rewriter, DBSchedule schedule) {
     Value numElements = createNumElements(loc, rewriter, op.getSource());
     memref::StoreOp::create(rewriter, loc, numElements, pingNumElements[i],
                             tagIndex);
-    bool created = createDMAStartOp(loc, rewriter, op.getSource(),
-                                    op.getTarget(), pingWaits[i]);
+    bool created = createDMAStartFromCopy(loc, rewriter, op, pingWaits[i]);
     assert(created && "unable to create dma_start");
     rewriter.eraseOp(op);
   }
 
-  // Insert ping and pong waits.
-  rewriter.setInsertionPointAfter(schedule.pingSchedule.prefetch);
-  insertDMAWaits(loc, rewriter, pingWaits, tagIndex, pingNumElements);
-  rewriter.setInsertionPointAfter(schedule.pongSchedule.prefetch);
-  insertDMAWaits(loc, rewriter, pongWaits, tagIndex, pongNumElements);
+  // Select tags with the same loop-carried `cur` value that S1 uses to select
+  // the physical tile buffers. true means current=ping and next=pong.
+  if (schedule.kernel.getRegionIterArgs().size() != 1)
+    return;
+  Value cur = schedule.kernel.getRegionIterArgs().front();
+  rewriter.setInsertionPoint(schedule.body.prefetch);
+  SmallVector<Value> currentWaits;
+  SmallVector<Value> nextWaits;
+  SmallVector<Value> currentNumElements;
+  SmallVector<Value> nextNumElements;
+  for (auto [ping, pong, pingNum, pongNum] :
+       llvm::zip(pingWaits, pongWaits, pingNumElements, pongNumElements)) {
+    currentWaits.push_back(
+        arith::SelectOp::create(rewriter, loc, cur, ping, pong));
+    nextWaits.push_back(
+        arith::SelectOp::create(rewriter, loc, cur, pong, ping));
+    currentNumElements.push_back(
+        arith::SelectOp::create(rewriter, loc, cur, pingNum, pongNum));
+    nextNumElements.push_back(
+        arith::SelectOp::create(rewriter, loc, cur, pongNum, pingNum));
+  }
 
-  // Replace memref.copy with dma-start (and dma-wait for stores).
-  replacePrefetchWithDMA(loc, rewriter, schedule.pingSchedule.prefetch,
-                         pongWaits, pongNumElements, tagIndex);
-  replacePrefetchWithDMA(loc, rewriter, schedule.pongSchedule.prefetch,
-                         pingWaits, pingNumElements, tagIndex);
+  SmallVector<Value> currentStoreWaits;
+  for (auto [ping, pong] : llvm::zip(pingStoreWaits, pongStoreWaits))
+    currentStoreWaits.push_back(
+        arith::SelectOp::create(rewriter, loc, cur, ping, pong));
 
-  replaceStoreshWithDMA(loc, rewriter, schedule.pingSchedule, pingStoreWaits,
-                        tagIndex);
-  replaceStoreshWithDMA(loc, rewriter, schedule.pongSchedule, pongStoreWaits,
-                        tagIndex);
+  // Start loading the next tile, then wait for the current tile before
+  // entering its compute slice.
+  replacePrefetchWithDMA(loc, rewriter, schedule.body.prefetch, nextWaits,
+                         nextNumElements, tagIndex);
+  rewriter.setInsertionPointAfter(schedule.body.prefetch);
+  insertDMAWaits(loc, rewriter, currentWaits, tagIndex, currentNumElements);
+
+  replaceStoresWithDMA(loc, rewriter, schedule.body, currentStoreWaits,
+                       tagIndex);
 
   // db_compute 只用于 S1/S2 之间传递调度信息，DMA 改写完成后清理。
-  for (Operation *compute : schedule.pingSchedule.computeOps)
-    compute->removeAttr("db_compute");
-  for (Operation *compute : schedule.pongSchedule.computeOps)
+  for (Operation *compute : schedule.body.computeOps)
     compute->removeAttr("db_compute");
 }
 
-/// Extract the prefetch section of ping-pong sub-kernels.
-bool extractPreFetch(scf::IfOp kernel, KernelSchedule &schedule) {
-  Region &thenRegion = kernel.getThenRegion();
-  if (thenRegion.empty() || thenRegion.getBlocks().size() > 1)
-    return false;
-  Block &block = thenRegion.front();
-  if (block.empty())
-    return false;
-  // We could relax this to be not the first op
-  Operation &firstOp = block.front();
-  auto ifOp = dyn_cast<scf::IfOp>(firstOp);
-  if (!ifOp || !ifOp->hasAttr("db_prefetch"))
-    return false;
-  schedule.prefetch = ifOp;
-  return true;
-}
+// Extract the single-copy loop body produced by S1.
+bool extractKernelBody(scf::ForOp kernel, KernelSchedule &schedule) {
+  for (Operation &op : kernel.getBody()->without_terminator()) {
+    auto ifOp = dyn_cast<scf::IfOp>(&op);
+    if (ifOp && ifOp->hasAttr("db_prefetch")) {
+      if (schedule.prefetch)
+        return false;
+      schedule.prefetch = ifOp;
+    }
+  }
 
-// Extract the store-back after kernel (ping or pong) compute slice.
-bool extractStoreBack(scf::IfOp kernel, KernelSchedule &schedule) {
   // schedule.prefetch is already set by extractPreFetch
   if (!schedule.prefetch)
     return false;
@@ -277,7 +295,7 @@ bool extractStoreBack(scf::IfOp kernel, KernelSchedule &schedule) {
     }
     currentOp = currentOp->getNextNode();
   }
-  if (schedule.computeOps.empty() || schedule.stores.empty())
+  if (schedule.computeOps.empty())
     return false;
   return true;
 }
@@ -308,38 +326,9 @@ bool extractSchedule(scf::ForOp forOp, DBSchedule &schedule) {
     return false;
   DBG("Prologue = " << schedule.prologue);
 
-  // Extract ping-pong kernels.
-  bool pingKernelFound = false, pongKernelFound = false;
-  for (Operation &op : *forOp.getBody()) {
-    auto ifOp = dyn_cast<scf::IfOp>(op);
-    if (!ifOp)
-      continue;
-    if (auto attr = ifOp->hasAttr("db_ping_kernel")) {
-      assert(!pingKernelFound && !pongKernelFound &&
-             "multiple ping kernel not expected");
-      schedule.pingKernel = ifOp;
-      pingKernelFound = true;
-      continue;
-    }
-    if (auto attr = ifOp->hasAttr("db_pong_kernel")) {
-      assert(pingKernelFound && !pongKernelFound &&
-             "reverse  ping pong not expected");
-      schedule.pongKernel = ifOp;
-      pongKernelFound = true;
-      break;
-    }
-  }
-  if (!pingKernelFound || !pongKernelFound)
-    return false;
-
-  if (!extractPreFetch(schedule.pingKernel, schedule.pingSchedule) ||
-      !extractPreFetch(schedule.pongKernel, schedule.pongSchedule))
-    return false;
-
-  if (!extractStoreBack(schedule.pingKernel, schedule.pingSchedule) ||
-      !extractStoreBack(schedule.pongKernel, schedule.pongSchedule) ||
-      schedule.pingSchedule.stores.size() !=
-          schedule.pongSchedule.stores.size())
+  if (forOp.getRegionIterArgs().size() != 1 ||
+      !forOp.getRegionIterArgs().front().getType().isInteger(1) ||
+      !extractKernelBody(forOp, schedule.body))
     return false;
   return true;
 }

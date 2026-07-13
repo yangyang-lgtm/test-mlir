@@ -8,10 +8,11 @@
 //===----------------------------------------------------------------------===//
 //
 // This pass transforms single-buffered tiled linalg-generic loops into
-// software-pipelined double-buffered loops using ping-pong buffers to overlap
-// DMA transfers with computation. It allocates two buffer sets, creates a
-// prologue to prefetch the first iteration, and generates alternating ping/pong
-// sub-kernels that prefetch the next iteration while computing the current one.
+// software-pipelined double-buffered loops using two buffer sets to overlap DMA
+// transfers with computation. It creates a prologue to prefetch the first
+// iteration, then carries the current-buffer selector through one loop. Each
+// iteration prefetches the next tile, waits for and computes the current tile,
+// writes it back, and flips the selector.
 //
 // This implementation is mainly in two main passes. First is this one and
 // the next is in DoubleBufferGenericS2.cpp
@@ -44,6 +45,7 @@ using namespace mlir;
 using namespace hexagon;
 
 #define GEN_PASS_DEF_HEXAGONDOUBLEBUFFERGENERICS1
+#define GEN_PASS_DEF_HEXAGONDOUBLEBUFFERREDUCES1
 #include "hexagon/Transforms/Passes.h.inc"
 
 namespace {
@@ -59,7 +61,27 @@ struct SingleBufferSchedule {
   SmallVector<ScheduleTriplet> triplets;
   SmallVector<Operation *> computeOps;
   SmallVector<memref::CopyOp> stores;
+  bool isReduction = false;
 };
+
+/// Return one tile-sized view into a backing allocation whose leading
+/// dimension contains both physical double-buffer slots.
+Value createDoubleBufferView(IRRewriter &rewriter, Location loc, Value backing,
+                             MemRefType tileType, Value leadingOffset) {
+  int64_t rank = tileType.getRank();
+  SmallVector<OpFoldResult> offsets(rank, rewriter.getIndexAttr(0));
+  SmallVector<OpFoldResult> sizes;
+  SmallVector<OpFoldResult> strides(rank, rewriter.getIndexAttr(1));
+  offsets.front() = leadingOffset;
+  for (int64_t size : tileType.getShape())
+    sizes.push_back(rewriter.getIndexAttr(size));
+
+  auto backingType = cast<MemRefType>(backing.getType());
+  auto viewType = memref::SubViewOp::inferResultType(
+      backingType, offsets, sizes, strides);
+  return memref::SubViewOp::create(rewriter, loc, viewType, backing, offsets,
+                                   sizes, strides);
+}
 
 /// 检查 memref.copy 是否具有预期的数据搬运方向。
 bool hasCopyDirection(memref::CopyOp copy, StringRef expected) {
@@ -113,6 +135,15 @@ Value cloneValueSlice(Value value, IRRewriter &rewriter, IRMapping &mapping,
     cloneValueSlice(operand, rewriter, mapping, sourceBlock, limit);
 
   Operation *cloned = def->clone(mapping);
+  // A mapped source may have a different strided offset (notably when it is a
+  // dynamically selected view into the combined double buffer). Re-infer a
+  // cloned subview's layout instead of retaining the old source-dependent type.
+  if (auto subview = dyn_cast<memref::SubViewOp>(cloned)) {
+    auto sourceType = cast<MemRefType>(subview.getSource().getType());
+    subview.getResult().setType(memref::SubViewOp::inferResultType(
+        sourceType, subview.getMixedOffsets(), subview.getMixedSizes(),
+        subview.getMixedStrides()));
+  }
   rewriter.insert(cloned);
   mapping.map(def->getResults(), cloned->getResults());
   return mapping.lookup(value);
@@ -424,6 +455,28 @@ struct TileMemorySSAAnalysis {
     return classifyComputeNodes();
   }
 
+  bool writesLoopCarriedExternalBuffer(Operation *op) {
+    auto memoryEffectOp = dyn_cast<MemoryEffectOpInterface>(op);
+    if (!memoryEffectOp)
+      return false;
+
+    SmallVector<MemoryEffects::EffectInstance> effects;
+    memoryEffectOp.getEffects(effects);
+    for (const MemoryEffects::EffectInstance &effect : effects) {
+      if (!isa<MemoryEffects::Write>(effect.getEffect()))
+        continue;
+      Value value = effect.getValue();
+      if (!value || !isa<BaseMemRefType>(value.getType()) ||
+          getTileIndex(value))
+        continue;
+
+      Operation *def = value.getDefiningOp();
+      if (!def || def->getBlock() != forOp.getBody())
+        return true;
+    }
+    return false;
+  }
+
   bool classifyComputeNodes() {
     // 从所有 preload 正向传播，找出由输入预取可达的节点。
     llvm::SmallBitVector reachableFromPreload(graph.size());
@@ -448,21 +501,26 @@ struct TileMemorySSAAnalysis {
         reachesStore.set(predecessor);
     }
 
+    bool hasStore = llvm::any_of(
+        graph, [](const TileAccessNode &node) { return node.isStore; });
+    bool hasReductionCompute = false;
     for (auto [nodeIndex, node] : llvm::enumerate(graph)) {
       if (node.isPreload || node.isStore)
         continue;
 
-      // compute 不由 op 类型决定，而是由数据流决定：它必须同时位于
-      // 某个 preload 的下游和某个 store 的上游。
-      node.isCompute =
-          reachableFromPreload.test(nodeIndex) && reachesStore.test(nodeIndex);
+      // 普通 tile 流要求 preload -> compute -> store。Reduction 流没有
+      // 循环内 store，而是原地更新循环外 accumulator。
+      node.isCompute = reachableFromPreload.test(nodeIndex) &&
+                       (hasStore ? reachesStore.test(nodeIndex)
+                                 : writesLoopCarriedExternalBuffer(node.op));
+      hasReductionCompute |= !hasStore && node.isCompute;
 
       // copy 只能作为已识别的 preload/store，不能夹在计算数据流内部。
       if (isa<memref::CopyOp>(node.op) || !node.isCompute)
         return false;
     }
-    return llvm::any_of(
-        graph, [](const TileAccessNode &node) { return node.isStore; });
+    schedule.isReduction = !hasStore && hasReductionCompute;
+    return hasStore || hasReductionCompute;
   }
 
   bool refineCopyInsToComputeUsedBuffers() {
@@ -507,7 +565,8 @@ struct TileMemorySSAAnalysis {
       if (node.isStore)
         schedule.stores.push_back(cast<memref::CopyOp>(node.op));
     }
-    return !schedule.computeOps.empty() && !schedule.stores.empty();
+    return !schedule.computeOps.empty() &&
+           (schedule.isReduction || !schedule.stores.empty());
   }
 
   bool validateScheduleDependencies() {
@@ -549,6 +608,8 @@ struct TileMemorySSAAnalysis {
 
     if (seenPreload.count() != tileAllocs.size())
       return false;
+    if (schedule.isReduction)
+      return seenCompute.count() != 0 && seenStore.none();
     // 只要求被回写的 tile 确实经过计算；纯输入 tile 不要求 store。
     for (memref::CopyOp store : schedule.stores) {
       auto tile = getTileIndex(store.getSource());
@@ -571,66 +632,13 @@ struct TileMemorySSAAnalysis {
   }
 };
 
-// Generate the ping or pong region IR of the double-buffered loop.
-void generatePingPongSubKernel(IRRewriter &rewriter,
-                               SingleBufferSchedule &schedule,
-                               scf::LoopNest &dbLoopNest, scf::IfOp ppongIfOp,
-                               Value nextExists, Value nextIdx,
-                               ArrayRef<Value> thisBuffers,
-                               ArrayRef<Value> nextBuffers, Value toggle,
-                               Value toggleNextStoreValue) {
-  auto forOp = schedule.forOp;
-  auto loc = forOp.getLoc();
-  auto context = forOp.getContext();
-  auto indVar = forOp.getInductionVar();
-
-  SmallVector<Value> ivs = llvm::map_to_vector(
-      dbLoopNest.loops, [](scf::ForOp loop) { return loop.getInductionVar(); });
-  assert(ivs.size() == 1 && "expecting a single loop at this point");
-  Block *forBody = dbLoopNest.loops.back().getBody();
-  Value newDBLoopIndVar = dbLoopNest.loops.back().getInductionVar();
-
-  // Create prefetch section: executes if this is not the last iteration.
-  rewriter.setInsertionPointToStart(&ppongIfOp.getThenRegion().front());
-  auto ifNotLastIter =
-      scf::IfOp::create(rewriter, loc, TypeRange(), nextExists, false);
-  ifNotLastIter->setAttr("db_prefetch", UnitAttr::get(context));
-  rewriter.setInsertionPointToStart(&ifNotLastIter.getThenRegion().front());
-  for (auto i = 0; i < schedule.triplets.size(); ++i) {
-    IRMapping mapping;
-    mapping.map(indVar, nextIdx);
-    mapping.map(schedule.triplets[i].alloc, nextBuffers[i]);
-    cloneCopyWithMappedSlices(schedule.triplets[i].load, rewriter, mapping,
-                              forOp.getBody(), "prefetch");
-  }
-
-  // Re-map the compute slice.
-  rewriter.setInsertionPointAfter(ifNotLastIter);
-  IRMapping mapping2;
-  mapping2.map(indVar, newDBLoopIndVar);
-  for (auto i = 0; i < schedule.triplets.size(); ++i)
-    mapping2.map(schedule.triplets[i].alloc, thisBuffers[i]);
-  for (Operation *compute : schedule.computeOps)
-    cloneOpWithMappedSlices(compute, rewriter, mapping2, forOp.getBody());
-
-  // Store the results.
-  for (auto i = 0; i < schedule.stores.size(); ++i) {
-    cloneCopyWithMappedSlices(schedule.stores[i], rewriter, mapping2,
-                              forOp.getBody(), "store");
-  }
-  memref::StoreOp::create(rewriter, loc, toggleNextStoreValue, toggle,
-                          ValueRange{});
-}
-
 /// Rewrite the single-buffered loop as double buffered.
 void rewriteAsDoubleBuffered(IRRewriter &rewriter, scf::ForOp sbForOp,
                              SingleBufferSchedule &schedule, int &uid) {
   auto loc = sbForOp.getLoc();
   auto context = sbForOp.getContext();
 
-  // Define some general types.
   auto boolType = rewriter.getI1Type();
-  auto boolMemrefType = MemRefType::get({}, boolType);
 
   RewriterBase::InsertionGuard guard(rewriter);
   rewriter.setInsertionPoint(sbForOp);
@@ -638,27 +646,26 @@ void rewriteAsDoubleBuffered(IRRewriter &rewriter, scf::ForOp sbForOp,
   // Define some general constants.
   Value trueVal = arith::ConstantOp::create(rewriter, loc, boolType,
                                             rewriter.getBoolAttr(true));
-  Value falseVal = arith::ConstantOp::create(rewriter, loc, boolType,
-                                             rewriter.getBoolAttr(false));
-
-  // Allocate `toggle` for ping-pong state and initialize it to true.
-  Value toggle = memref::AllocOp::create(rewriter, loc, boolMemrefType);
-  auto store =
-      memref::StoreOp::create(rewriter, loc, trueVal, toggle, ValueRange{});
-
-  // Allocate Ping-Pong Buffers.
+  // Allocate one backing memref per tile. Its leading dimension stores the two
+  // physical slots consecutively.
   int64_t alignment = 2048;
   auto alignmentAttr = rewriter.getI64IntegerAttr(alignment);
-  SmallVector<Value, 3> pingBuffers;
-  SmallVector<Value, 3> pongBuffers;
+  Value zeroIndex = arith::ConstantIndexOp::create(rewriter, loc, 0);
+  SmallVector<Value, 3> backingBuffers;
+  SmallVector<Value, 3> firstBuffers;
   for (auto i = 0; i < schedule.triplets.size(); ++i) {
     auto alloc = schedule.triplets[i].alloc;
-    Value ping = memref::AllocOp::create(rewriter, loc, alloc.getType(),
-                                         mlir::ValueRange{}, alignmentAttr);
-    Value pong = memref::AllocOp::create(rewriter, loc, alloc.getType(),
-                                         mlir::ValueRange{}, alignmentAttr);
-    pingBuffers.push_back(ping);
-    pongBuffers.push_back(pong);
+    auto tileType = cast<MemRefType>(alloc.getType());
+    SmallVector<int64_t> backingShape(tileType.getShape());
+    backingShape.front() *= 2;
+    auto backingType =
+        MemRefType::get(backingShape, tileType.getElementType(),
+                        tileType.getLayout(), tileType.getMemorySpace());
+    Value backing = memref::AllocOp::create(
+        rewriter, loc, backingType, mlir::ValueRange{}, alignmentAttr);
+    backingBuffers.push_back(backing);
+    firstBuffers.push_back(
+        createDoubleBufferView(rewriter, loc, backing, tileType, zeroIndex));
   }
 
   // Get the bounds from the single-buffer original for-loop.
@@ -673,35 +680,57 @@ void rewriteAsDoubleBuffered(IRRewriter &rewriter, scf::ForOp sbForOp,
       arith::CmpIOp::create(rewriter, loc, mlir::arith::CmpIPredicate::slt,
                             lowerBound, upperBound)
           .getResult();
-  Value mayLoopVar = memref::AllocOp::create(rewriter, loc, boolMemrefType);
-  memref::StoreOp::create(rewriter, loc, mayLoop, mayLoopVar, ValueRange{});
-  Value mayLoopReFetch =
-      memref::LoadOp::create(rewriter, loc, boolType, mayLoopVar);
   auto ifMayLoop =
-      scf::IfOp::create(rewriter, loc, TypeRange(), mayLoopReFetch, false);
+      scf::IfOp::create(rewriter, loc, TypeRange(), mayLoop, false);
   ifMayLoop->setAttr("db_generic", idAttr);
   ifMayLoop->setAttr("db_prologue", UnitAttr::get(context));
   rewriter.setInsertionPointToStart(&ifMayLoop.getThenRegion().front());
   for (auto i = 0; i < schedule.triplets.size(); ++i) {
     IRMapping mapping;
     mapping.map(indVar, lowerBound);
-    mapping.map(schedule.triplets[i].alloc, pingBuffers[i]);
+    mapping.map(schedule.triplets[i].alloc, firstBuffers[i]);
     cloneCopyWithMappedSlices(schedule.triplets[i].load, rewriter, mapping,
                               sbForOp.getBody(), "prefetch");
   }
 
-  // Kernel: create the new double-buffered top-loop.
+  // Kernel: carry the current-buffer selector instead of cloning ping and pong
+  // sub-kernels. This keeps the compute slice single-copy.
   rewriter.setInsertionPoint(sbForOp);
-  scf::LoopNest loopNest = scf::buildLoopNest(
-      rewriter, loc, SmallVector<Value>{lowerBound},
-      SmallVector<Value>{upperBound}, SmallVector<Value>{step});
-  loopNest.loops.back()->setAttr("db_generic", idAttr);
-  Block *forBody = loopNest.loops.back().getBody();
-  Value dbIndVar = loopNest.loops.back().getInductionVar();
+  auto dbLoop = scf::ForOp::create(rewriter, loc, lowerBound, upperBound, step,
+                                   ValueRange{trueVal});
+  dbLoop->setAttr("db_generic", idAttr);
+  Block *forBody = dbLoop.getBody();
+  if (!forBody->empty() && isa<scf::YieldOp>(forBody->back()))
+    forBody->back().erase();
+  rewriter.setInsertionPointToStart(forBody);
+  Value dbIndVar = dbLoop.getInductionVar();
+  Value cur = dbLoop.getRegionIterArgs().front();
 
-  // Toggle decides whether this is ping-or-pong-stage.
-  rewriter.setInsertionPoint(forBody->getTerminator());
-  Value toggleVal = memref::LoadOp::create(rewriter, loc, boolType, toggle);
+  // cur=true means slot 0 is current and slot 1 is next. Convert the selector
+  // to offsets instead of selecting between two memref SSA values.
+  Value nextSlot =
+      arith::IndexCastUIOp::create(rewriter, loc, rewriter.getIndexType(), cur);
+  Value currentSlotBit =
+      arith::XOrIOp::create(rewriter, loc, cur, trueVal);
+  Value currentSlot = arith::IndexCastUIOp::create(
+      rewriter, loc, rewriter.getIndexType(), currentSlotBit);
+
+  SmallVector<Value, 3> currentBuffers;
+  SmallVector<Value, 3> nextBuffers;
+  for (auto [backing, triplet] :
+       llvm::zip(backingBuffers, schedule.triplets)) {
+    auto tileType = cast<MemRefType>(triplet.alloc.getType());
+    Value tileExtent =
+        arith::ConstantIndexOp::create(rewriter, loc, tileType.getDimSize(0));
+    Value currentOffset =
+        arith::MulIOp::create(rewriter, loc, currentSlot, tileExtent);
+    Value nextOffset =
+        arith::MulIOp::create(rewriter, loc, nextSlot, tileExtent);
+    currentBuffers.push_back(createDoubleBufferView(
+        rewriter, loc, backing, tileType, currentOffset));
+    nextBuffers.push_back(createDoubleBufferView(rewriter, loc, backing,
+                                                 tileType, nextOffset));
+  }
 
   // Check if next preload should happen (or this is last iteration).
   Value nextIdx =
@@ -711,37 +740,56 @@ void rewriteAsDoubleBuffered(IRRewriter &rewriter, scf::ForOp sbForOp,
                             nextIdx, upperBound)
           .getResult();
 
-  // Ping sub-kernel.
-  auto pingIfOp =
-      scf::IfOp::create(rewriter, loc, TypeRange(), toggleVal, false);
-  pingIfOp->setAttr("db_ping_kernel", UnitAttr::get(context));
-  generatePingPongSubKernel(rewriter, schedule, loopNest, pingIfOp, nextExists,
-                            nextIdx, pingBuffers, pongBuffers, toggle,
-                            falseVal /*toggleNextStoreValue*/);
+  auto ifNext =
+      scf::IfOp::create(rewriter, loc, TypeRange(), nextExists, false);
+  ifNext->setAttr("db_prefetch", UnitAttr::get(context));
+  rewriter.setInsertionPointToStart(&ifNext.getThenRegion().front());
+  for (auto i = 0; i < schedule.triplets.size(); ++i) {
+    IRMapping mapping;
+    mapping.map(indVar, nextIdx);
+    mapping.map(schedule.triplets[i].alloc, nextBuffers[i]);
+    cloneCopyWithMappedSlices(schedule.triplets[i].load, rewriter, mapping,
+                              sbForOp.getBody(), "prefetch");
+  }
 
-  // Pong sub-kernel.
-  rewriter.setInsertionPointAfter(pingIfOp);
-  Value invertedToggleVal =
-      arith::XOrIOp::create(rewriter, loc, toggleVal, trueVal);
-  auto pongIfOp =
-      scf::IfOp::create(rewriter, loc, TypeRange(), invertedToggleVal, false);
-  pongIfOp->setAttr("db_pong_kernel", UnitAttr::get(context));
-  generatePingPongSubKernel(rewriter, schedule, loopNest, pongIfOp, nextExists,
-                            nextIdx, pongBuffers, pingBuffers, toggle,
-                            trueVal /*toggleNextStoreValue*/);
+  // Compute and store the current tile after the next-tile prefetch has
+  // started. Stage 2 inserts the current DMA waits at this boundary.
+  rewriter.setInsertionPointAfter(ifNext);
+  IRMapping mapping;
+  mapping.map(indVar, dbIndVar);
+  for (auto i = 0; i < schedule.triplets.size(); ++i)
+    mapping.map(schedule.triplets[i].alloc, currentBuffers[i]);
+  for (Operation *compute : schedule.computeOps)
+    cloneOpWithMappedSlices(compute, rewriter, mapping, sbForOp.getBody());
+  for (memref::CopyOp store : schedule.stores)
+    cloneCopyWithMappedSlices(store, rewriter, mapping, sbForOp.getBody(),
+                              "store");
+
+  Value nextCur = arith::XOrIOp::create(rewriter, loc, cur, trueVal);
+  scf::YieldOp::create(rewriter, loc, nextCur);
   rewriter.eraseOp(sbForOp);
 }
 
 // State machine to parse the `tiled_generic`.
 bool generateSchedule(IRRewriter &rewriter, scf::ForOp forOp,
                       SingleBufferSchedule &schedule,
-                      AliasAnalysis &aliasAnalysis) {
+                      AliasAnalysis &aliasAnalysis, bool requireReduction) {
   if (!forOp.getInitArgs().empty())
     return false;
   schedule.forOp = forOp;
 
   TileMemorySSAAnalysis analysis{aliasAnalysis, forOp, schedule};
-  return analysis.run();
+  if (!analysis.run())
+    return false;
+  if (schedule.isReduction != requireReduction)
+    return false;
+
+  // The combined backing allocation currently requires a non-scalar static
+  // tile shape so the second slot has a compile-time leading offset.
+  return llvm::all_of(schedule.triplets, [](ScheduleTriplet triplet) {
+    auto type = cast<MemRefType>(triplet.alloc.getType());
+    return type.getRank() > 0 && type.hasStaticShape();
+  });
 }
 
 // The concrete implementation of the DoubleBufferGenericS1 pass.
@@ -760,10 +808,35 @@ struct HexagonDoubleBufferGenericS1Pass
     func.walk([&uniqueID, &aliasAnalysis](scf::ForOp forOp) {
       SingleBufferSchedule schedule;
       IRRewriter rewriter(forOp.getContext());
-      bool viableCandidate =
-          generateSchedule(rewriter, forOp, schedule, aliasAnalysis);
+      bool viableCandidate = generateSchedule(
+          rewriter, forOp, schedule, aliasAnalysis,
+          /*requireReduction=*/false);
       if (viableCandidate)
         rewriteAsDoubleBuffered(rewriter, forOp, schedule, uniqueID);
+      return WalkResult::advance();
+    });
+  }
+};
+
+struct HexagonDoubleBufferReduceS1Pass
+    : public ::impl::HexagonDoubleBufferReduceS1Base<
+          HexagonDoubleBufferReduceS1Pass> {
+  void getDependentDialects(DialectRegistry &registry) const override {
+    registry.insert<scf::SCFDialect>();
+  }
+
+  void runOnOperation() override {
+    int uniqueID = 0;
+    auto func = getOperation();
+    auto &aliasAnalysis = getAnalysis<AliasAnalysis>();
+
+    func.walk([&](scf::ForOp forOp) {
+      SingleBufferSchedule schedule;
+      IRRewriter rewriter(forOp.getContext());
+      if (generateSchedule(rewriter, forOp, schedule, aliasAnalysis,
+                           /*requireReduction=*/true)) {
+        rewriteAsDoubleBuffered(rewriter, forOp, schedule, uniqueID);
+      }
       return WalkResult::advance();
     });
   }
@@ -774,4 +847,9 @@ struct HexagonDoubleBufferGenericS1Pass
 std::unique_ptr<InterfacePass<mlir::FunctionOpInterface>>
 hexagon::createHexagonDoubleBufferGenericS1Pass() {
   return std::make_unique<HexagonDoubleBufferGenericS1Pass>();
+}
+
+std::unique_ptr<InterfacePass<mlir::FunctionOpInterface>>
+hexagon::createHexagonDoubleBufferReduceS1Pass() {
+  return std::make_unique<HexagonDoubleBufferReduceS1Pass>();
 }

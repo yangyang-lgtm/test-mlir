@@ -25,6 +25,12 @@ std::unique_ptr<OperationPass<func::FuncOp>>
 createAnnotateMemrefCopyDirectionPass();
 
 std::unique_ptr<OperationPass<func::FuncOp>>
+createSetTensorAllocSharedMemoryPass();
+
+std::unique_ptr<OperationPass<func::FuncOp>>
+createPlanSharedMemoryPass();
+
+std::unique_ptr<OperationPass<func::FuncOp>>
 createHoistDoubleBufferCopyInsPass();
 
 std::unique_ptr<OperationPass<func::FuncOp>> createCopyCanonicalizationPass();
@@ -52,6 +58,9 @@ std::unique_ptr<OperationPass<ModuleOp>> createHexagonAddFastMathPass();
 
 std::unique_ptr<InterfacePass<FunctionOpInterface>>
 createHexagonDoubleBufferGenericS1Pass();
+
+std::unique_ptr<InterfacePass<FunctionOpInterface>>
+createHexagonDoubleBufferReduceS1Pass();
 
 std::unique_ptr<InterfacePass<FunctionOpInterface>>
 createHexagonDoubleBufferGenericS2Pass();
