@@ -193,19 +193,6 @@ def HexagonDoubleBufferGenericS1 :
        "hexagon::createHexagonDoubleBufferGenericS1Pass()";
 }
 
-def HexagonDoubleBufferReduceS1 :
-    InterfacePass<"hexagon-double-buffer-reduce-s1",
-                  "mlir::FunctionOpInterface"> {
-  let summary = "double buffer input tiles of accumulator reductions";
-  let description = [{
-    Software-pipelines reduction loops whose input tile is copied from global
-    memory into shared memory and whose accumulator buffer is allocated outside
-    the loop. This form has no per-iteration shared-to-global result copy.
-  }];
-  let constructor =
-       "hexagon::createHexagonDoubleBufferReduceS1Pass()";
-}
-
 def HexagonDoubleBufferGenericS2 :
     InterfacePass<"hexagon-double-buffer-generic-s2",
                   "mlir::FunctionOpInterface"> {

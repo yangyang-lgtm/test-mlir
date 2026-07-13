@@ -72,6 +72,10 @@ struct KernelSchedule {
 struct DBSchedule {
   // kernel 之前的 prologue if，用于预取第一轮 tile。
   scf::IfOp prologue;
+  // prologue 被 canonicalizer 折叠为直线代码时，记录第一轮 preload copy。
+  SmallVector<memref::CopyOp> directProloguePreloads;
+  // tag/numElements 临时 buffer 的插入锚点。
+  Operation *prologueAnchor = nullptr;
   // S1 生成的双缓冲 kernel loop，带有 db_generic 属性。
   scf::ForOp kernel;
   // kernel body 内部的 prefetch/compute/store 调度。
@@ -193,22 +197,28 @@ void rewriteAsDMATransfers(IRRewriter &rewriter, DBSchedule schedule) {
 
   // 收集 prologue 中的第一轮 preload copy。
   SmallVector<memref::CopyOp, 3> preloads;
-  // S1 prologue 是一个 scf.if，第一轮 preload 位于 then region。
-  Region &thenRegion = schedule.prologue.getThenRegion();
-  assert(!thenRegion.empty() && thenRegion.getBlocks().size() == 1);
-  // 取 prologue then block。
-  Block &block = thenRegion.front();
-  // 遍历 prologue 中的所有顶层操作。
-  for (Operation &op : block) {
-    // 只关心 memref.copy。
-    auto copyOp = dyn_cast<memref::CopyOp>(&op);
-    // prologue 中的 copy 使用 ping tag，并且必须是输入预取。
-    if (copyOp && hasCopyRoleAndDirection(copyOp, "prefetch", kGlobalToShared))
-      preloads.push_back(copyOp);
+  if (schedule.prologue) {
+    // S1 prologue 是一个 scf.if，第一轮 preload 位于 then region。
+    Region &thenRegion = schedule.prologue.getThenRegion();
+    assert(!thenRegion.empty() && thenRegion.getBlocks().size() == 1);
+    // 取 prologue then block。
+    Block &block = thenRegion.front();
+    // 遍历 prologue 中的所有顶层操作。
+    for (Operation &op : block) {
+      // 只关心 memref.copy。
+      auto copyOp = dyn_cast<memref::CopyOp>(&op);
+      // prologue 中的 copy 使用 ping tag，并且必须是输入预取。
+      if (copyOp &&
+          hasCopyRoleAndDirection(copyOp, "prefetch", kGlobalToShared))
+        preloads.push_back(copyOp);
+    }
+  } else {
+    preloads.append(schedule.directProloguePreloads.begin(),
+                    schedule.directProloguePreloads.end());
   }
 
   // 创建访问 memref<1x...> tag/numElements buffer 的固定下标 0。
-  rewriter.setInsertionPoint(schedule.prologue);
+  rewriter.setInsertionPoint(schedule.prologueAnchor);
   Value zero = arith::ConstantIndexOp::create(rewriter, loc, 0);
   // memref.load/store/dma_wait 需要 index list，这里始终访问 [0]。
   SmallVector<Value> tagIndex = {zero};
@@ -422,11 +432,25 @@ bool extractSchedule(scf::ForOp forOp, DBSchedule &schedule) {
       foundPrologue = true;
       // 保存 prologue。
       schedule.prologue = ifOp;
+      schedule.prologueAnchor = ifOp;
       break;
     }
   }
-  // 找不到 prologue，不能安全 DMA 化。
-  if (!foundPrologue)
+  if (!foundPrologue) {
+    for (Operation *prev = forOp->getPrevNode(); prev != nullptr;
+         prev = prev->getPrevNode()) {
+      auto copyOp = dyn_cast<memref::CopyOp>(prev);
+      if (!copyOp ||
+          !hasCopyRoleAndDirection(copyOp, "prefetch", kGlobalToShared))
+        continue;
+      schedule.directProloguePreloads.push_back(copyOp);
+      schedule.prologueAnchor = copyOp;
+    }
+    std::reverse(schedule.directProloguePreloads.begin(),
+                 schedule.directProloguePreloads.end());
+  }
+  // 找不到 guarded 或 direct prologue，不能安全 DMA 化。
+  if (!schedule.prologue && schedule.directProloguePreloads.empty())
     return false;
   // debug 输出找到的 prologue。
   DBG("Prologue = " << schedule.prologue);

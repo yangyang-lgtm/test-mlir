@@ -386,8 +386,6 @@ public:
         pm.addNestedPass<func::FuncOp>(createAnnotateMemrefCopyDirectionPass());
         pm.addNestedPass<func::FuncOp>(createHoistDoubleBufferCopyInsPass());
         pm.addNestedPass<func::FuncOp>(
-            createHexagonDoubleBufferReduceS1Pass());
-        pm.addNestedPass<func::FuncOp>(
             createHexagonDoubleBufferGenericS1Pass());
       }
 

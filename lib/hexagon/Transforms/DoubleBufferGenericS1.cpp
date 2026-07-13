@@ -41,15 +41,16 @@ using namespace mlir;
 using namespace hexagon;
 
 #define GEN_PASS_DEF_HEXAGONDOUBLEBUFFERGENERICS1
-#define GEN_PASS_DEF_HEXAGONDOUBLEBUFFERREDUCES1
 #include "hexagon/Transforms/Passes.h.inc"
 
 namespace {
 
 /// 用于解析并保存单缓冲调度的结构体。
 struct ScheduleTriplet {
-  // 原始单缓冲循环中的 shared/tile buffer 分配。
-  memref::AllocOp alloc;
+  // 原始单缓冲循环中的 shared/tile buffer root，通常是 alloc 或 view。
+  Value tile;
+  // 输入预取 copy 前的 tile 初始化/清理操作，例如 masked load 的 padding fill。
+  SmallVector<Operation *> setupOps;
   // 将 global 数据拷贝到该 tile buffer 的输入预取 copy。
   memref::CopyOp load;
 };
@@ -102,12 +103,16 @@ bool hasCopyDirection(memref::CopyOp copy, StringRef expected) {
   return direction && direction.getValue() == expected;
 }
 
-memref::AllocOp findBaseAlloc(Value value) {
+Value findTileRoot(Value value) {
   // 沿着 view/cast 链一直向源头追溯。
   while (true) {
     // 找到 memref.alloc 就认为找到了 tile 的底层分配。
     if (auto alloc = value.getDefiningOp<memref::AllocOp>())
-      return alloc;
+      return alloc.getMemref();
+    // memref.view 通常是共享 i8 slab 上切出的 typed tile，保留 typed view
+    // 作为可替换的 tile root。
+    if (auto view = value.getDefiningOp<memref::ViewOp>())
+      return view.getResult();
     // subview 不创建新存储，继续追溯它的 source。
     if (auto subview = value.getDefiningOp<memref::SubViewOp>()) {
       value = subview.getSource();
@@ -124,19 +129,20 @@ memref::AllocOp findBaseAlloc(Value value) {
       continue;
     }
     // 其它来源无法静态确认是可双缓冲 tile alloc，保守返回空。
-    return nullptr;
+    return {};
   }
 }
 
-bool isAvailableBeforeCopy(memref::AllocOp alloc, scf::ForOp forOp,
-                           memref::CopyOp copy) {
-  // tile alloc 如果在 loop body 内，必须支配对应 copy。
+bool isAvailableBeforeCopy(Value tile, scf::ForOp forOp, memref::CopyOp copy) {
+  Operation *def = tile.getDefiningOp();
+  if (!def)
+    return false;
+  // tile root 如果在 loop body 内，必须支配对应 copy。
   Block *forBody = forOp.getBody();
-  if (alloc->getBlock() == forBody)
-    return alloc->isBeforeInBlock(copy);
-  // tile alloc 如果在 loop 外，必须位于 forOp 之前，才能被新 prologue/kernel 使用。
-  return alloc->getBlock() == forOp->getBlock() &&
-         alloc->isBeforeInBlock(forOp);
+  if (def->getBlock() == forBody)
+    return def->isBeforeInBlock(copy);
+  // tile root 如果在 loop 外，必须位于 forOp 之前，才能被新 prologue/kernel 使用。
+  return def->getBlock() == forOp->getBlock() && def->isBeforeInBlock(forOp);
 }
 
 bool isDefinedInBlockBefore(Operation *op, Block *block, Operation *limit) {
@@ -205,7 +211,8 @@ memref::CopyOp cloneCopyWithMappedSlices(memref::CopyOp copy,
 }
 
 Operation *cloneOpWithMappedSlices(Operation *op, IRRewriter &rewriter,
-                                   IRMapping &mapping, Block *sourceBlock) {
+                                   IRMapping &mapping, Block *sourceBlock,
+                                   bool markCompute = true) {
   // compute op 的 operands 可能依赖局部 subview/cast，需要先克隆这些地址切片。
   for (Value operand : op->getOperands())
     cloneValueSlice(operand, rewriter, mapping, sourceBlock, op);
@@ -217,7 +224,8 @@ Operation *cloneOpWithMappedSlices(Operation *op, IRRewriter &rewriter,
   // 将 compute 产生的结果继续映射给后续被克隆操作使用。
   mapping.map(op->getResults(), cloned->getResults());
   // 标记由 S1 克隆出的计算节点，供 S2 恢复调度结构。
-  cloned->setAttr("db_compute", UnitAttr::get(op->getContext()));
+  if (markCompute)
+    cloned->setAttr("db_compute", UnitAttr::get(op->getContext()));
   // 返回克隆后的 compute op。
   return cloned;
 }
@@ -229,6 +237,11 @@ enum TileAccessKind : uint8_t {
   TileWrite = 2,
 };
 
+enum class ScheduleKind {
+  Pointwise,
+  Reduction,
+};
+
 struct TileAccessNode {
   // 原始 loop body 顶层操作。
   Operation *op;
@@ -238,6 +251,8 @@ struct TileAccessNode {
   SmallVector<unsigned> predecessors;
   // 是否是输入预取：global_to_shared copy。
   bool isPreload = false;
+  // 是否是输入预取 copy 前的 tile setup，例如边界 tile 的 zero fill。
+  bool isPreloadSetup = false;
   // 是否是由 preload 数据流驱动的计算。
   bool isCompute = false;
   // 是否是结果回写：shared_to_global copy。
@@ -260,10 +275,10 @@ struct TileMemorySSAAnalysis {
   scf::ForOp forOp;
   // 成功识别后填充的调度信息。
   SingleBufferSchedule &schedule;
-  // 从 global_to_shared copy target 中发现的 tile alloc。
-  SmallVector<memref::AllocOp> tileAllocs;
-  // tile alloc operation -> tileAllocs 下标。
-  llvm::SmallDenseMap<Operation *, unsigned> tileIndices;
+  // 从 global_to_shared copy target 中发现的 tile root。
+  SmallVector<Value> tileAllocs;
+  // tile root value -> tileAllocs 下标。
+  llvm::SmallDenseMap<Value, unsigned> tileIndices;
   // 被确认是 preload 的 copy operation 集合。
   llvm::SmallDenseSet<Operation *> preloadCopies;
   // 按原 loop body 顺序保存的 tile 访问节点图。
@@ -273,6 +288,9 @@ struct TileMemorySSAAnalysis {
     // preload 在诊断图中显示为 LOAD。
     if (node.isPreload)
       return "LOAD";
+    // preload setup 在诊断图中显示为 LOAD_SETUP。
+    if (node.isPreloadSetup)
+      return "LOAD_SETUP";
     // compute 在诊断图中显示为 COMPUTE。
     if (node.isCompute)
       return "COMPUTE";
@@ -305,9 +323,12 @@ struct TileMemorySSAAnalysis {
     os << "\n";
 
     os << "tiles:\n";
-    for (auto [tileIndex, alloc] : llvm::enumerate(tileAllocs)) {
+    for (auto [tileIndex, tile] : llvm::enumerate(tileAllocs)) {
       os << "  tile#" << tileIndex << ": ";
-      alloc->print(os, OpPrintingFlags().skipRegions());
+      if (Operation *def = tile.getDefiningOp())
+        def->print(os, OpPrintingFlags().skipRegions());
+      else
+        tile.print(os);
       os << "\n";
     }
 
@@ -378,9 +399,9 @@ struct TileMemorySSAAnalysis {
     if (!isa<BaseMemRefType>(value.getType()))
       return std::nullopt;
     // subview/cast 等派生值通过 AliasAnalysis 归并到对应 tile alloc。
-    for (auto [index, alloc] : llvm::enumerate(tileAllocs)) {
+    for (auto [index, tile] : llvm::enumerate(tileAllocs)) {
       // 只要 value 可能别名到该 tile alloc，就归类到这个 tile。
-      if (aliasAnalysis.alias(value, alloc.getMemref()))
+      if (aliasAnalysis.alias(value, tile))
         return index;
     }
     // 不属于任何被跟踪 tile。
@@ -391,6 +412,73 @@ struct TileMemorySSAAnalysis {
     // 只要任意 tile 的访问位非空，该 op 就需要进入依赖图。
     return llvm::any_of(accesses,
                         [](uint8_t access) { return access != NoTileAccess; });
+  }
+
+  bool isOverwriteFillSetupOp(Operation *op) {
+    if (isa<linalg::FillOp>(op))
+      return true;
+
+    auto ifOp = dyn_cast<scf::IfOp>(op);
+    if (!ifOp || !ifOp.getElseRegion().empty())
+      return false;
+
+    bool foundFill = false;
+    bool onlyFillLikeOps = true;
+    ifOp.walk([&](Operation *nested) {
+      if (nested == op || isa<scf::YieldOp>(nested))
+        return WalkResult::advance();
+      if (isa<linalg::FillOp>(nested)) {
+        foundFill = true;
+        return WalkResult::advance();
+      }
+      if (isMemoryEffectFree(nested))
+        return WalkResult::advance();
+      onlyFillLikeOps = false;
+      return WalkResult::interrupt();
+    });
+    return foundFill && onlyFillLikeOps;
+  }
+
+  std::optional<unsigned> getSingleSetupTile(const TileAccessNode &node) {
+    std::optional<unsigned> setupTile;
+    for (auto [tileIndex, access] : llvm::enumerate(node.accesses)) {
+      if (access == NoTileAccess)
+        continue;
+      bool isOverwrite = access == TileWrite ||
+                         (access == (TileRead | TileWrite) &&
+                          isOverwriteFillSetupOp(node.op));
+      if (!isOverwrite)
+        return std::nullopt;
+      if (setupTile)
+        return std::nullopt;
+      setupTile = tileIndex;
+    }
+    return setupTile;
+  }
+
+  bool hasFollowingPreloadForTile(unsigned nodeIndex, unsigned tileIndex) {
+    for (unsigned nextIndex = nodeIndex + 1; nextIndex < graph.size();
+         ++nextIndex) {
+      const TileAccessNode &next = graph[nextIndex];
+      if (!next.isPreload)
+        continue;
+      if (!(next.accesses[tileIndex] & TileWrite))
+        continue;
+      if (llvm::is_contained(next.predecessors, nodeIndex))
+        return true;
+    }
+    return false;
+  }
+
+  bool isPreloadSetupCandidate(unsigned nodeIndex) {
+    TileAccessNode &node = graph[nodeIndex];
+    if (node.isPreload || node.isStore || isa<memref::CopyOp>(node.op))
+      return false;
+
+    auto setupTile = getSingleSetupTile(node);
+    if (!setupTile)
+      return false;
+    return hasFollowingPreloadForTile(nodeIndex, *setupTile);
   }
 
   void addCopyAccesses(memref::CopyOp copy, TileAccessNode &node) {
@@ -423,8 +511,8 @@ struct TileMemorySSAAnalysis {
         return false;
 
       // 把 effect value 通过 alias analysis 映射到所有可能的 tile。
-      for (auto [index, alloc] : llvm::enumerate(tileAllocs)) {
-        if (!aliasAnalysis.alias(effectValue, alloc.getMemref()))
+      for (auto [index, tile] : llvm::enumerate(tileAllocs)) {
+        if (!aliasAnalysis.alias(effectValue, tile))
           continue;
         // 记录 tile read。
         if (isRead)
@@ -440,9 +528,9 @@ struct TileMemorySSAAnalysis {
 
   void addConservativeModRefAccesses(Operation *op, TileAccessNode &node) {
     // 无法获得带 Value 的精确 effect 时，回退到保守 ModRef 查询。
-    for (auto [index, alloc] : llvm::enumerate(tileAllocs)) {
+    for (auto [index, tile] : llvm::enumerate(tileAllocs)) {
       // 对每个 tile 单独询问 op 是否可能读/写它。
-      ModRefResult modRef = aliasAnalysis.getModRef(op, alloc.getMemref());
+      ModRefResult modRef = aliasAnalysis.getModRef(op, tile);
       // Ref 表示可能读取。
       if (modRef.isRef())
         node.accesses[index] |= TileRead;
@@ -462,22 +550,22 @@ struct TileMemorySSAAnalysis {
       if (!copy || !hasCopyDirection(copy, kGlobalToShared))
         continue;
       // 如果 source 也来自某个 tile alloc，这不是 global 输入预取。
-      auto sourceAlloc = findBaseAlloc(copy.getSource());
+      auto sourceAlloc = findTileRoot(copy.getSource());
       // tile -> tile 或 tile -> external 的 copy 不是输入预取。
-      if (sourceAlloc && tileIndices.contains(sourceAlloc.getOperation()))
+      if (sourceAlloc && tileIndices.contains(sourceAlloc))
         continue;
       // target 必须能追溯到一个 tile alloc。
-      auto alloc = findBaseAlloc(copy.getTarget());
+      auto alloc = findTileRoot(copy.getTarget());
       // alloc 必须在 copy 处可用，否则无法安全映射到新双缓冲结构。
       if (!alloc || !isAvailableBeforeCopy(alloc, forOp, copy))
         continue;
       // 同一 tile 出现多个预取定义时，当前线性版本模型无法唯一分类。
-      if (tileIndices.contains(alloc.getOperation()))
+      if (tileIndices.contains(alloc))
         return false;
       // 保存 tile alloc 与对应 preload copy。
-      schedule.triplets.push_back({alloc, copy});
+      schedule.triplets.push_back({alloc, {}, copy});
       // 建立 alloc 到 tile index 的映射。
-      tileIndices[alloc.getOperation()] = tileAllocs.size();
+      tileIndices[alloc] = tileAllocs.size();
       // 记录 tile alloc 列表。
       tileAllocs.push_back(alloc);
       // 记录这个 copy 在访问图中应被分类为 preload。
@@ -560,8 +648,8 @@ struct TileMemorySSAAnalysis {
       // 将节点加入图。
       graph.push_back(std::move(node));
     }
-    // 图建好后，继续根据数据流把非 copy 节点分类为 compute。
-    return classifyComputeNodes();
+    // 图构建完成，具体的 pointwise/reduction 分类由独立 classifier 完成。
+    return true;
   }
 
   bool writesLoopCarriedExternalBuffer(Operation *op) {
@@ -593,7 +681,14 @@ struct TileMemorySSAAnalysis {
     return false;
   }
 
-  bool classifyComputeNodes() {
+  void classifyPreloadSetupNodes() {
+    for (auto [nodeIndex, node] : llvm::enumerate(graph)) {
+      if (isPreloadSetupCandidate(nodeIndex))
+        node.isPreloadSetup = true;
+    }
+  }
+
+  llvm::SmallBitVector computeReachableFromPreload() {
     // 从所有 preload 正向传播，找出由输入预取可达的节点。
     // reachableFromPreload[i] 表示节点 i 依赖某个 LOAD。
     llvm::SmallBitVector reachableFromPreload(graph.size());
@@ -607,7 +702,10 @@ struct TileMemorySSAAnalysis {
       if (reachable)
         reachableFromPreload.set(nodeIndex);
     }
+    return reachableFromPreload;
+  }
 
+  llvm::SmallBitVector computeReachesStore() {
     // 从所有 store 沿前驱边反向传播，找出能够影响结果回写的节点。
     // reachesStore[i] 表示节点 i 的结果最终流向某个 STORE。
     llvm::SmallBitVector reachesStore(graph.size());
@@ -625,35 +723,77 @@ struct TileMemorySSAAnalysis {
       for (unsigned predecessor : graph[nodeIndex].predecessors)
         reachesStore.set(predecessor);
     }
+    return reachesStore;
+  }
 
-    // 普通 generic 必须存在 shared_to_global store；reduction 则没有 store。
+  std::optional<ScheduleKind> inferScheduleKind() {
     bool hasStore = llvm::any_of(
         graph, [](const TileAccessNode &node) { return node.isStore; });
-    // reduction 模式下至少要找到一个写外部 accumulator 的 compute。
-    bool hasReductionCompute = false;
+    if (hasStore)
+      return ScheduleKind::Pointwise;
+
+    llvm::SmallBitVector reachableFromPreload = computeReachableFromPreload();
     for (auto [nodeIndex, node] : llvm::enumerate(graph)) {
-      // LOAD 和 STORE 已经分类，跳过。
-      if (node.isPreload || node.isStore)
+      if (node.isPreload || node.isPreloadSetup)
+        continue;
+      if (reachableFromPreload.test(nodeIndex) &&
+          writesLoopCarriedExternalBuffer(node.op))
+        return ScheduleKind::Reduction;
+    }
+    return std::nullopt;
+  }
+
+  bool classifyPointwiseSchedule() {
+    llvm::SmallBitVector reachableFromPreload = computeReachableFromPreload();
+    llvm::SmallBitVector reachesStore = computeReachesStore();
+
+    for (auto [nodeIndex, node] : llvm::enumerate(graph)) {
+      // LOAD/SETUP/STORE 已经分类，跳过。
+      if (node.isPreload || node.isPreloadSetup || node.isStore)
         continue;
 
-      // 普通 tile 流要求 preload -> compute -> store。Reduction 流没有
-      // 循环内 store，而是原地更新循环外 accumulator。
-      // 有 store 时按普通 generic 规则；无 store 时按 reduction 规则。
-      node.isCompute = reachableFromPreload.test(nodeIndex) &&
-                       (hasStore ? reachesStore.test(nodeIndex)
-                                 : writesLoopCarriedExternalBuffer(node.op));
-      // 记录 reduction 路径是否确实发现 compute。
-      hasReductionCompute |= !hasStore && node.isCompute;
+      // 普通 pointwise 要求计算既由 preload 驱动，又最终流向 store。
+      node.isCompute =
+          reachableFromPreload.test(nodeIndex) && reachesStore.test(nodeIndex);
 
       // copy 只能作为已识别的 preload/store，不能夹在计算数据流内部。
       // 任意无法分类的 tile 访问都会让当前 loop 失去候选资格。
       if (isa<memref::CopyOp>(node.op) || !node.isCompute)
         return false;
     }
-    // 没有 store 且有 reduction compute 时，整个 schedule 标记为 reduction。
-    schedule.isReduction = !hasStore && hasReductionCompute;
-    // 普通 generic 需要 store；reduction 需要 reduction compute。
-    return hasStore || hasReductionCompute;
+    schedule.isReduction = false;
+    return true;
+  }
+
+  bool classifyReductionSchedule() {
+    llvm::SmallBitVector reachableFromPreload = computeReachableFromPreload();
+    bool hasReductionCompute = false;
+    for (auto [nodeIndex, node] : llvm::enumerate(graph)) {
+      // LOAD/SETUP 已经分类，跳过。
+      if (node.isPreload || node.isPreloadSetup)
+        continue;
+
+      // Reduction 流没有循环内 store，而是原地更新循环外 accumulator。
+      node.isCompute = reachableFromPreload.test(nodeIndex) &&
+                       writesLoopCarriedExternalBuffer(node.op);
+      hasReductionCompute |= node.isCompute;
+
+      // copy 只能作为已识别的 preload，不能夹在计算数据流内部。
+      // 任意无法分类的 tile 访问都会让当前 loop 失去候选资格。
+      if (isa<memref::CopyOp>(node.op) || !node.isCompute)
+        return false;
+    }
+    schedule.isReduction = true;
+    return hasReductionCompute;
+  }
+
+  bool classifySchedule() {
+    classifyPreloadSetupNodes();
+    std::optional<ScheduleKind> kind = inferScheduleKind();
+    if (!kind)
+      return false;
+    return *kind == ScheduleKind::Reduction ? classifyReductionSchedule()
+                                            : classifyPointwiseSchedule();
   }
 
   bool refineCopyInsToComputeUsedBuffers() {
@@ -672,19 +812,19 @@ struct TileMemorySSAAnalysis {
 
     // 准备压缩后的 schedule 和 tile bookkeeping。
     SmallVector<ScheduleTriplet> refinedTriplets;
-    SmallVector<memref::AllocOp> refinedAllocs;
-    llvm::SmallDenseMap<Operation *, unsigned> refinedIndices;
+    SmallVector<Value> refinedAllocs;
+    llvm::SmallDenseMap<Value, unsigned> refinedIndices;
     llvm::SmallDenseSet<Operation *> refinedPreloadCopies;
     for (auto [index, triplet] : llvm::enumerate(schedule.triplets)) {
       // 跳过 compute 完全没用到的 preload。
       if (!usedByCompute.test(index))
         continue;
       // 为保留下来的 tile 分配新的连续下标。
-      refinedIndices[triplet.alloc.getOperation()] = refinedAllocs.size();
+      refinedIndices[triplet.tile] = refinedAllocs.size();
       // 保留 alloc/copy 调度对。
       refinedTriplets.push_back(triplet);
       // 保留 tile alloc。
-      refinedAllocs.push_back(triplet.alloc);
+      refinedAllocs.push_back(triplet.tile);
       // 保留 preload copy 标记。
       refinedPreloadCopies.insert(triplet.load.getOperation());
     }
@@ -706,6 +846,13 @@ struct TileMemorySSAAnalysis {
     schedule.computeOps.clear();
     schedule.stores.clear();
     for (const TileAccessNode &node : graph) {
+      // preload setup 会随对应的 load 一起克隆到 prologue/next-prefetch。
+      if (node.isPreloadSetup) {
+        auto tile = getSingleSetupTile(node);
+        if (!tile)
+          return false;
+        schedule.triplets[*tile].setupOps.push_back(node.op);
+      }
       // compute op 会被克隆到新 loop 的 current-buffer 阶段。
       if (node.isCompute)
         schedule.computeOps.push_back(node.op);
@@ -745,6 +892,13 @@ struct TileMemorySSAAnalysis {
             return false;
           // 标记该 tile 已完成 preload。
           seenPreload.set(index);
+          continue;
+        }
+        if (node.isPreloadSetup) {
+          // setup 必须是 preload 前的纯 tile 写，不能读旧 tile 内容。
+          if (!(access & TileWrite) || seenPreload.test(index) ||
+              seenCompute.test(index) || seenStore.test(index))
+            return false;
           continue;
         }
         if (node.isCompute) {
@@ -787,9 +941,10 @@ struct TileMemorySSAAnalysis {
     // 第一次构图用于剔除未参与计算的预取；收缩 tile 集合后重新构图，
     // 保证最终节点索引和访问向量一致。
     // 任一阶段失败，都表示当前 loop 不适合这个 pass 改写。
-    if (!collectCopyIns() || !buildAccessGraph() ||
+    if (!collectCopyIns() || !buildAccessGraph() || !classifySchedule() ||
         !refineCopyInsToComputeUsedBuffers() || !buildAccessGraph() ||
-        !collectScheduleFromGraph() || !validateScheduleDependencies())
+        !classifySchedule() || !collectScheduleFromGraph() ||
+        !validateScheduleDependencies())
       return false;
 
     // 打印识别出的 tile MemorySSA 图，方便观察 LOAD/COMPUTE/STORE 关系。
@@ -832,9 +987,9 @@ void rewriteAsDoubleBuffered(IRRewriter &rewriter, scf::ForOp sbForOp,
   SmallVector<Value, 3> firstBuffers;
   for (auto i = 0; i < schedule.triplets.size(); ++i) {
     // 取出原始 tile alloc。
-    auto alloc = schedule.triplets[i].alloc;
+    Value tile = schedule.triplets[i].tile;
     // 原始 tile 的 memref 类型。
-    auto tileType = cast<MemRefType>(alloc.getType());
+    auto tileType = cast<MemRefType>(tile.getType());
     // backing shape 初始等于 tile shape。
     SmallVector<int64_t> backingShape(tileType.getShape());
     // 第一维扩大两倍，用一块 allocation 表示 ping/pong 两个 slot。
@@ -884,7 +1039,11 @@ void rewriteAsDoubleBuffered(IRRewriter &rewriter, scf::ForOp sbForOp,
     // 第一轮的原 induction variable 等价于 lowerBound。
     mapping.map(indVar, lowerBound);
     // 原 tile alloc 映射到 slot0 view。
-    mapping.map(schedule.triplets[i].alloc, firstBuffers[i]);
+    mapping.map(schedule.triplets[i].tile, firstBuffers[i]);
+    // 克隆第一轮 copy-in 前的 tile setup。
+    for (Operation *setup : schedule.triplets[i].setupOps)
+      cloneOpWithMappedSlices(setup, rewriter, mapping, sbForOp.getBody(),
+                              /*markCompute=*/false);
     // 克隆原 load copy，并标记为 prefetch。
     cloneCopyWithMappedSlices(schedule.triplets[i].load, rewriter, mapping,
                               sbForOp.getBody(), "prefetch");
@@ -930,7 +1089,7 @@ void rewriteAsDoubleBuffered(IRRewriter &rewriter, scf::ForOp sbForOp,
   for (auto [backing, triplet] :
        llvm::zip(backingBuffers, schedule.triplets)) {
     // 取原 tile 类型以得到 slot 大小。
-    auto tileType = cast<MemRefType>(triplet.alloc.getType());
+    auto tileType = cast<MemRefType>(triplet.tile.getType());
     // 一个 slot 在 backing 第一维上占 tileType.getDimSize(0)。
     Value tileExtent =
         arith::ConstantIndexOp::create(rewriter, loc, tileType.getDimSize(0));
@@ -971,7 +1130,11 @@ void rewriteAsDoubleBuffered(IRRewriter &rewriter, scf::ForOp sbForOp,
     // 原 induction variable 映射到 nextIdx。
     mapping.map(indVar, nextIdx);
     // 原 tile alloc 映射到 next slot view。
-    mapping.map(schedule.triplets[i].alloc, nextBuffers[i]);
+    mapping.map(schedule.triplets[i].tile, nextBuffers[i]);
+    // 克隆下一轮 copy-in 前的 tile setup。
+    for (Operation *setup : schedule.triplets[i].setupOps)
+      cloneOpWithMappedSlices(setup, rewriter, mapping, sbForOp.getBody(),
+                              /*markCompute=*/false);
     // 克隆 load copy，仍标记为 prefetch。
     cloneCopyWithMappedSlices(schedule.triplets[i].load, rewriter, mapping,
                               sbForOp.getBody(), "prefetch");
@@ -987,7 +1150,7 @@ void rewriteAsDoubleBuffered(IRRewriter &rewriter, scf::ForOp sbForOp,
   mapping.map(indVar, dbIndVar);
   // 所有原 tile alloc 映射到 current slot view。
   for (auto i = 0; i < schedule.triplets.size(); ++i)
-    mapping.map(schedule.triplets[i].alloc, currentBuffers[i]);
+    mapping.map(schedule.triplets[i].tile, currentBuffers[i]);
   // 克隆 compute 操作；普通 generic 和 reduction 都会走这里。
   for (Operation *compute : schedule.computeOps)
     cloneOpWithMappedSlices(compute, rewriter, mapping, sbForOp.getBody());
@@ -1007,7 +1170,7 @@ void rewriteAsDoubleBuffered(IRRewriter &rewriter, scf::ForOp sbForOp,
 // 解析 tiled_generic 风格 loop 的调度入口。
 bool generateSchedule(IRRewriter &rewriter, scf::ForOp forOp,
                       SingleBufferSchedule &schedule,
-                      AliasAnalysis &aliasAnalysis, bool requireReduction) {
+                      AliasAnalysis &aliasAnalysis) {
   // 当前 rewrite 只会自己新增一个 selector iter_arg，不支持原 loop 已有 iter_args。
   if (!forOp.getInitArgs().empty())
     return false;
@@ -1019,16 +1182,13 @@ bool generateSchedule(IRRewriter &rewriter, scf::ForOp forOp,
   // 分析失败表示该 loop 不满足当前 pass 支持的双缓冲形态。
   if (!analysis.run())
     return false;
-  // GenericS1 要求非 reduction；ReduceS1 要求 reduction，这里负责隔离两个 pass。
-  if (schedule.isReduction != requireReduction)
-    return false;
 
   // 合并后的 backing allocation 目前要求非标量静态 tile shape，这样第二个 slot
   // 才有编译期可确定的 leading offset。
   // backing 第一维需要乘 2，因此 tile 必须是 rank>0 且静态 shape。
   return llvm::all_of(schedule.triplets, [](ScheduleTriplet triplet) {
     // 读取原 tile alloc 的 memref 类型。
-    auto type = cast<MemRefType>(triplet.alloc.getType());
+    auto type = cast<MemRefType>(triplet.tile.getType());
     // 标量或动态 shape 暂不支持创建稳定的双 slot backing。
     return type.getRank() > 0 && type.hasStaticShape();
   });
@@ -1049,38 +1209,10 @@ struct HexagonDoubleBufferGenericS1Pass
     func.walk([&uniqueID, &aliasAnalysis](scf::ForOp forOp) {
       SingleBufferSchedule schedule;
       IRRewriter rewriter(forOp.getContext());
-      // requireReduction=false：要求 load -> compute -> store 数据流。
-      bool viableCandidate = generateSchedule(
-          rewriter, forOp, schedule, aliasAnalysis,
-          /*requireReduction=*/false);
+      bool viableCandidate =
+          generateSchedule(rewriter, forOp, schedule, aliasAnalysis);
       if (viableCandidate)
         rewriteAsDoubleBuffered(rewriter, forOp, schedule, uniqueID);
-      return WalkResult::advance();
-    });
-  }
-};
-
-struct HexagonDoubleBufferReduceS1Pass
-    : public ::impl::HexagonDoubleBufferReduceS1Base<
-          HexagonDoubleBufferReduceS1Pass> {
-  void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<scf::SCFDialect>();
-  }
-
-  void runOnOperation() override {
-    int uniqueID = 0;
-    auto func = getOperation();
-    auto &aliasAnalysis = getAnalysis<AliasAnalysis>();
-
-    func.walk([&](scf::ForOp forOp) {
-      SingleBufferSchedule schedule;
-      IRRewriter rewriter(forOp.getContext());
-      // requireReduction=true：只接受 preload -> compute external accumulator 形态。
-      if (generateSchedule(rewriter, forOp, schedule, aliasAnalysis,
-                           /*requireReduction=*/true)) {
-        // reduction 的 stores 可以为空，rewrite 会只克隆 compute。
-        rewriteAsDoubleBuffered(rewriter, forOp, schedule, uniqueID);
-      }
       return WalkResult::advance();
     });
   }
@@ -1090,9 +1222,4 @@ struct HexagonDoubleBufferReduceS1Pass
 std::unique_ptr<InterfacePass<mlir::FunctionOpInterface>>
 hexagon::createHexagonDoubleBufferGenericS1Pass() {
   return std::make_unique<HexagonDoubleBufferGenericS1Pass>();
-}
-
-std::unique_ptr<InterfacePass<mlir::FunctionOpInterface>>
-hexagon::createHexagonDoubleBufferReduceS1Pass() {
-  return std::make_unique<HexagonDoubleBufferReduceS1Pass>();
 }

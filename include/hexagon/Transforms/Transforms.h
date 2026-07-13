@@ -60,9 +60,6 @@ std::unique_ptr<InterfacePass<FunctionOpInterface>>
 createHexagonDoubleBufferGenericS1Pass();
 
 std::unique_ptr<InterfacePass<FunctionOpInterface>>
-createHexagonDoubleBufferReduceS1Pass();
-
-std::unique_ptr<InterfacePass<FunctionOpInterface>>
 createHexagonDoubleBufferGenericS2Pass();
 
 std::unique_ptr<OperationPass<ModuleOp>>
