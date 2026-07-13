@@ -8,7 +8,8 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 #add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fcoroutines>)
 
 set(AIR_ENABLE_AIE ON)
-set(LLVM_BUILD_PATH "/home/yaoshi16ultra/workspace/llvm-project/build")
+#LLVM_BUILD_PATH="/home/yaoshi16ultra/workspace/llvm-project/build"
+set(LLVM_BUILD_PATH $ENV{LLVM_BUILD_PATH})
 set(LLVM_LIBRARY_DIR "${LLVM_BUILD_PATH}/lib")
 
 function(add_triton_object name)
