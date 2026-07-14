@@ -109,7 +109,7 @@ struct VTCMTilingPass : public ::impl::VTCMTilingBase<VTCMTilingPass> {
 // Annotate tiled IR for later passes (e.g. double buffering)
 void annotateOp(Operation *op) {
   op->setAttr("all_parallel", mlir::UnitAttr::get(op->getContext()));
-  op->setAttr("tiled_generic", mlir::UnitAttr::get(op->getContext()));
+  op->setAttr(kTiledGenericAttr, mlir::UnitAttr::get(op->getContext()));
 }
 
 void annotateTiledLoop(linalg::GenericOp op, linalg::TiledLinalgOp tiledOp) {

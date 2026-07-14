@@ -9,8 +9,8 @@ add_mlir_conversion_library(DMAToLLVM
   Core
 
   LINK_LIBS PUBLIC
+  MemRefExt
   MLIRDialectUtils
   MLIRIR
   HexagonCommon
 )
-

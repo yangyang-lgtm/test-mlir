@@ -13,7 +13,7 @@
 #include "hexagon/Common/Common.h"
 #include "hexagon/Conversion/DMAToLLVM/DMAExternalFnNames.h"
 #include "hexagon/Conversion/DMAToLLVM/Passes.h"
-#include "hexagon/Dialect/HexagonMem/IR/HexagonMemDialect.h"
+#include "hexagon/Dialect/MemRefExt/IR/MemRefExtDialect.h"
 #include "mlir/Conversion/LLVMCommon/ConversionTarget.h"
 #include "mlir/Conversion/LLVMCommon/Pattern.h"
 #include "mlir/Dialect/LLVMIR/FunctionCallUtils.h"
@@ -29,7 +29,6 @@
 
 using namespace mlir;
 using namespace hexagon;
-using namespace mlir::hexagonmem;
 
 #define GEN_PASS_DEF_DMATOLLVM
 #include "hexagon/Conversion/DMAToLLVM/Passes.h.inc"
@@ -80,6 +79,52 @@ struct LowerDMAStart : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
                   ConversionPatternRewriter &rewriter) const override;
 };
 
+struct LowerDMA2DStart : public ConvertToLLVMPattern {
+  LowerDMA2DStart(MLIRContext *context,
+                  const LLVMTypeConverter &typeConverter,
+                  PatternBenefit benefit = 1)
+      : ConvertToLLVMPattern("memref_ext.dma_2d_start", context, typeConverter,
+                             benefit) {}
+
+  LogicalResult
+  matchAndRewrite(Operation *op, ArrayRef<Value> operands,
+                  ConversionPatternRewriter &rewriter) const override;
+};
+
+struct LowerDMAExtStart : public ConvertToLLVMPattern {
+  LowerDMAExtStart(MLIRContext *context,
+                   const LLVMTypeConverter &typeConverter,
+                   PatternBenefit benefit = 1)
+      : ConvertToLLVMPattern("memref_ext.dma_start", context, typeConverter,
+                             benefit) {}
+
+  LogicalResult
+  matchAndRewrite(Operation *op, ArrayRef<Value> operands,
+                  ConversionPatternRewriter &rewriter) const override;
+};
+
+struct LowerDMAHandle : public ConvertToLLVMPattern {
+  LowerDMAHandle(MLIRContext *context, const LLVMTypeConverter &typeConverter,
+                 PatternBenefit benefit = 1)
+      : ConvertToLLVMPattern("memref_ext.dma_handle", context, typeConverter,
+                             benefit) {}
+
+  LogicalResult
+  matchAndRewrite(Operation *op, ArrayRef<Value> operands,
+                  ConversionPatternRewriter &rewriter) const override;
+};
+
+struct LowerDMAExtWait : public ConvertToLLVMPattern {
+  LowerDMAExtWait(MLIRContext *context, const LLVMTypeConverter &typeConverter,
+                  PatternBenefit benefit = 1)
+      : ConvertToLLVMPattern("memref_ext.dma_wait", context, typeConverter,
+                             benefit) {}
+
+  LogicalResult
+  matchAndRewrite(Operation *op, ArrayRef<Value> operands,
+                  ConversionPatternRewriter &rewriter) const override;
+};
+
 // Function to get or create the DMA start function in the module
 static FailureOr<LLVM::LLVMFuncOp>
 getDMAStartFn(ModuleOp module, StringRef fnName,
@@ -104,9 +149,13 @@ getDMA2DStartFn(ModuleOp module, StringRef fnName,
        rewriter.getI32Type(), rewriter.getI32Type(), rewriter.getI32Type(),
        rewriter.getI32Type(), rewriter.getI32Type(), rewriter.getI32Type(),
        rewriter.getI32Type(), rewriter.getI32Type(), rewriter.getI32Type(),
-       getPtrTy(context)},
+      getPtrTy(context)},
       rewriter.getI32Type());
 }
+
+static FailureOr<LLVM::LLVMFuncOp>
+getDMAWaitFn(ModuleOp module, StringRef fnName,
+             ConversionPatternRewriter &rewriter);
 
 // Function to convert a value to i32 type
 Value convertToI32Type(mlir::Location loc, Value value,
@@ -276,6 +325,183 @@ LowerDMAStart::matchAndRewrite(memref::DmaStartOp op, OpAdaptor adaptor,
   return success();
 }
 
+LogicalResult LowerDMAExtStart::matchAndRewrite(
+    Operation *op, ArrayRef<Value> operands,
+    ConversionPatternRewriter &rewriter) const {
+  MLIRContext *context = op->getContext();
+  Location loc = op->getLoc();
+  ModuleOp module = op->getParentOfType<ModuleOp>();
+  if (op->getNumOperands() != 4 || operands.size() != 4)
+    return failure();
+
+  FailureOr<LLVM::LLVMFuncOp> funcOp =
+      getDMAStartFn(module, mlir::hexagon::getDMAStartFnName(), rewriter);
+  if (failed(funcOp))
+    return failure();
+
+  auto isVTCM = [](Value memref) {
+    auto memrefType = cast<MemRefType>(memref.getType());
+    return isInVTCMAddressSpace(memrefType);
+  };
+
+  auto getMemRefPtr = [this, loc](Value memref, Value llvmMemref,
+                                  ConversionPatternRewriter &rewriter) {
+    auto memrefType = cast<MemRefType>(memref.getType());
+    SmallVector<Value> indices;
+    for (unsigned i = 0; i < memrefType.getRank(); ++i)
+      indices.push_back(LLVM::ConstantOp::create(
+          rewriter, loc, getIndexType(), 0));
+    return getStridedElementPtr(rewriter, loc, memrefType, llvmMemref,
+                                indices);
+  };
+
+  Value source = op->getOperand(0);
+  Value target = op->getOperand(1);
+  Value llvmSrcPtr = getMemRefPtr(source, operands[0], rewriter);
+  Value llvmDstPtr = getMemRefPtr(target, operands[1], rewriter);
+  Value llvmHandlePtr = operands[3];
+
+  Value numElements = convertToI32Type(loc, operands[2], rewriter, context);
+  Value typeSizeInBytes = getI32Constant(
+      rewriter, loc,
+      cast<MemRefType>(source.getType())
+              .getElementType()
+              .getIntOrFloatBitWidth() /
+          8);
+  Value transferSize =
+      LLVM::MulOp::create(rewriter, loc, numElements, typeSizeInBytes);
+
+  SmallVector<Value, 8> callOperands = {
+      llvmSrcPtr,
+      getI32Constant(rewriter, loc, isVTCM(source) ? 1 : 0),
+      llvmDstPtr,
+      getI32Constant(rewriter, loc, isVTCM(target) ? 1 : 0),
+      transferSize,
+      getI32Constant(rewriter, loc, 0),
+      getI32Constant(rewriter, loc, 0),
+      llvmHandlePtr};
+
+  rewriter.eraseOp(op);
+  auto dmaCopyOp =
+      LLVM::CallOp::create(rewriter, loc, funcOp.value(), callOperands);
+  Value token = *dmaCopyOp.getODSResults(0).begin();
+  LLVM::StoreOp::create(rewriter, loc, token, llvmHandlePtr);
+  return success();
+}
+
+LogicalResult LowerDMA2DStart::matchAndRewrite(
+    Operation *op, ArrayRef<Value> operands,
+    ConversionPatternRewriter &rewriter) const {
+  MLIRContext *context = op->getContext();
+  Location loc = op->getLoc();
+  ModuleOp module = op->getParentOfType<ModuleOp>();
+  if (op->getNumOperands() != 7 || operands.size() != 7)
+    return failure();
+
+  FailureOr<LLVM::LLVMFuncOp> funcOp = getDMA2DStartFn(
+      module, mlir::hexagon::getDMA2DStartFnName(), rewriter);
+  if (failed(funcOp))
+    return failure();
+
+  auto isVTCM = [](Value memref) {
+    auto memrefType = cast<MemRefType>(memref.getType());
+    return isInVTCMAddressSpace(memrefType);
+  };
+
+  auto getMemRefPtr = [this, loc](Value memref, Value llvmMemref,
+                                  ConversionPatternRewriter &rewriter) {
+    auto memrefType = cast<MemRefType>(memref.getType());
+    SmallVector<Value> indices;
+    for (unsigned i = 0; i < memrefType.getRank(); ++i)
+      indices.push_back(LLVM::ConstantOp::create(
+          rewriter, loc, getIndexType(), 0));
+    return getStridedElementPtr(rewriter, loc, memrefType, llvmMemref,
+                                indices);
+  };
+
+  Value source = op->getOperand(0);
+  Value target = op->getOperand(1);
+  Value llvmSrcPtr = getMemRefPtr(source, operands[0], rewriter);
+  Value llvmDstPtr = getMemRefPtr(target, operands[1], rewriter);
+  Value llvmHandlePtr = operands[3];
+
+  Value numElements = convertToI32Type(loc, operands[2], rewriter, context);
+  Value typeSizeInBytes = getI32Constant(
+      rewriter, loc,
+      cast<MemRefType>(source.getType())
+              .getElementType()
+              .getIntOrFloatBitWidth() /
+          8);
+  Value width = convertToI32Type(loc, operands[6], rewriter, context);
+  Value widthInBytes =
+      LLVM::MulOp::create(rewriter, loc, width, typeSizeInBytes);
+  Value height = LLVM::SDivOp::create(
+      rewriter, loc,
+      LLVM::MulOp::create(rewriter, loc, numElements, typeSizeInBytes),
+      widthInBytes);
+  Value srcStride = convertToI32Type(loc, operands[4], rewriter, context);
+  Value dstStride = convertToI32Type(loc, operands[5], rewriter, context);
+  Value srcStrideInBytes =
+      LLVM::MulOp::create(rewriter, loc, srcStride, typeSizeInBytes);
+  Value dstStrideInBytes =
+      LLVM::MulOp::create(rewriter, loc, dstStride, typeSizeInBytes);
+
+  SmallVector<Value, 16> callOperands = {
+      llvmSrcPtr,
+      getI32Constant(rewriter, loc, isVTCM(source) ? 1 : 0),
+      llvmDstPtr,
+      getI32Constant(rewriter, loc, isVTCM(target) ? 1 : 0),
+      widthInBytes,
+      height,
+      srcStrideInBytes,
+      dstStrideInBytes,
+      getI32Constant(rewriter, loc, 0),
+      getI32Constant(rewriter, loc, 0),
+      getI32Constant(rewriter, loc, 0),
+      getI32Constant(rewriter, loc, 0),
+      llvmHandlePtr};
+
+  rewriter.eraseOp(op);
+  auto dmaCopyOp =
+      LLVM::CallOp::create(rewriter, loc, funcOp.value(), callOperands);
+  Value token = *dmaCopyOp.getODSResults(0).begin();
+  LLVM::StoreOp::create(rewriter, loc, token, llvmHandlePtr);
+  return success();
+}
+
+LogicalResult LowerDMAHandle::matchAndRewrite(
+    Operation *op, ArrayRef<Value> operands,
+    ConversionPatternRewriter &rewriter) const {
+  Location loc = op->getLoc();
+  MLIRContext *context = op->getContext();
+  auto one = LLVM::ConstantOp::create(rewriter, loc, getIndexType(),
+                                      rewriter.getIndexAttr(1));
+  auto handle = LLVM::AllocaOp::create(rewriter, loc, getPtrTy(context),
+                                       rewriter.getI32Type(), one);
+  rewriter.replaceOp(op, handle.getResult());
+  return success();
+}
+
+LogicalResult LowerDMAExtWait::matchAndRewrite(
+    Operation *op, ArrayRef<Value> operands,
+    ConversionPatternRewriter &rewriter) const {
+  Location loc = op->getLoc();
+  ModuleOp module = op->getParentOfType<ModuleOp>();
+  if (op->getNumOperands() != 1 || operands.size() != 1)
+    return failure();
+
+  FailureOr<LLVM::LLVMFuncOp> funcOp =
+      getDMAWaitFn(module, mlir::hexagon::getDMAWaitFnName(), rewriter);
+  if (failed(funcOp))
+    return failure();
+
+  Value token =
+      LLVM::LoadOp::create(rewriter, loc, rewriter.getI32Type(), operands[0]);
+  rewriter.eraseOp(op);
+  LLVM::CallOp::create(rewriter, loc, funcOp.value(), ValueRange{token});
+  return success();
+}
+
 //===----------------------------------------------------------------------===//
 // Lower DMAWait
 //===----------------------------------------------------------------------===//
@@ -349,13 +575,16 @@ LowerDMAWait::matchAndRewrite(memref::DmaWaitOp op, OpAdaptor adaptor,
 void populateDMAToLLVMConversionPatterns(LLVMTypeConverter &converter,
                                          RewritePatternSet &patterns) {
   patterns.add<LowerDMAStart, LowerDMAWait>(converter);
+  patterns.add<LowerDMAHandle, LowerDMAExtStart, LowerDMA2DStart,
+               LowerDMAExtWait>(patterns.getContext(), converter);
 }
 
 struct DMAToLLVMPass : public ::impl::DMAToLLVMBase<DMAToLLVMPass> {
   using Base::Base;
 
   void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<memref::MemRefDialect, LLVM::LLVMDialect>();
+    registry.insert<memref::MemRefDialect, memref_ext::MemRefExtDialect,
+                    LLVM::LLVMDialect>();
   }
 
   void runOnOperation() override {
@@ -368,6 +597,9 @@ struct DMAToLLVMPass : public ::impl::DMAToLLVMBase<DMAToLLVMPass> {
     LLVMTypeConverter typeConverter(context, options);
 
     hexagon::addTypeConversions(context, typeConverter);
+    typeConverter.addConversion([context](memref_ext::DmaHandleType type) {
+      return LLVM::LLVMPointerType::get(context);
+    });
     populateDMAToLLVMConversionPatterns(typeConverter, patterns);
 
     if (failed(applyPartialConversion(moduleOp, target, std::move(patterns))))

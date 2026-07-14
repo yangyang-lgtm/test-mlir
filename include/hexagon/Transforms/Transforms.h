@@ -25,6 +25,11 @@ std::unique_ptr<OperationPass<func::FuncOp>>
 createAnnotateMemrefCopyDirectionPass();
 
 std::unique_ptr<OperationPass<func::FuncOp>>
+createScheduleDoubleBufferCopiesPass();
+
+std::unique_ptr<OperationPass<func::FuncOp>> createAnnotateForLoopKindPass();
+
+std::unique_ptr<OperationPass<func::FuncOp>>
 createSetTensorAllocSharedMemoryPass();
 
 std::unique_ptr<OperationPass<func::FuncOp>>
@@ -61,6 +66,12 @@ createHexagonDoubleBufferGenericS1Pass();
 
 std::unique_ptr<InterfacePass<FunctionOpInterface>>
 createHexagonDoubleBufferGenericS2Pass();
+
+std::unique_ptr<InterfacePass<FunctionOpInterface>>
+createHexagonDoubleBufferPlanRewritePass();
+
+std::unique_ptr<InterfacePass<FunctionOpInterface>>
+createHexagonDoubleBufferDMALoweringPass();
 
 std::unique_ptr<OperationPass<ModuleOp>>
 createHexagonLLVMEnableHexagonRoutinesPass();

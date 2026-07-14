@@ -1,5 +1,9 @@
 add_mlir_library(Transforms
   AnnotateMemrefCopyDirectionPass.cpp
+  ScheduleDoubleBufferCopiesPass.cpp
+  AnnotateForLoopKindPass.cpp
+  DoubleBufferPlanRewritePass.cpp
+  DoubleBufferDMALoweringPass.cpp
   SetTensorAllocSharedMemoryPass.cpp
   PlanSharedMemoryPass.cpp
   HoistDoubleBufferCopyInsPass.cpp
@@ -61,14 +65,17 @@ add_mlir_library(Transforms
   LINK_COMPONENTS
   Core
 
-  LINK_LIBS PUBLIC
+LINK_LIBS PUBLIC
 #        HexagonCommon
 #        HexagonMem
+  MemRefExt
   MLIRArithDialect
   MLIRAnalysis
   MLIRDialectUtils
   MLIRIR
+  MLIRLinalgDialect
   MLIRMathDialect
+  MLIRMemRefDialect
   MLIRPass
   MLIRTensorDialect
   MLIRTransforms

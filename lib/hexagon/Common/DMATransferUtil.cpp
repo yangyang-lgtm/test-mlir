@@ -33,6 +33,29 @@ bool isSafe(Type type) {
 static Value getI32Const(Location loc, IRRewriter &rewriter, int val) {
   return arith::ConstantIndexOp::create(rewriter, loc, val);
 }
+
+Value getInnermostDim(Location loc, IRRewriter &rewriter, Value memref) {
+  auto type = cast<MemRefType>(memref.getType());
+  int64_t dim = type.getRank() - 1;
+  if (type.isDynamicDim(dim))
+    return memref::DimOp::create(rewriter, loc, memref, dim);
+  return getI32Const(loc, rewriter, type.getDimSize(dim));
+}
+
+bool getStaticOuterStride(MemRefType type, int64_t &stride) {
+  int64_t offset;
+  SmallVector<int64_t> strides;
+  if (failed(type.getStridesAndOffset(strides, offset)) || type.getRank() <= 1)
+    return false;
+  if (ShapedType::isDynamic(strides[type.getRank() - 2]) ||
+      strides[type.getRank() - 1] != 1)
+    return false;
+  int64_t innerDim = type.getDimSize(type.getRank() - 1);
+  if (!ShapedType::isDynamic(innerDim) && strides[type.getRank() - 2] <= innerDim)
+    return false;
+  stride = strides[type.getRank() - 2];
+  return true;
+}
 } // unnamed namespace
 
 Value createNumElements(Location loc, IRRewriter &rewriter, Value view) {
@@ -65,14 +88,6 @@ bool createDMAStartOp(Location loc, IRRewriter &rewriter, Value source,
     return false;
   int64_t rank = sourceMemRefType.getRank();
 
-  // Create zero index for tag access
-  Value zero = arith::ConstantIndexOp::create(rewriter, loc, 0);
-  SmallVector<Value, 1> tagIndex = {zero};
-
-  SmallVector<Value, 8> zeroIndices(rank, zero);
-  SmallVector<Value, 8> tileIndices(rank, zero);
-  SmallVector<Value, 2> zeroIndex(1, zero);
-
   // Extract strides and offsets for source and target memrefs
   SmallVector<int64_t, 4> sourceStrides, targetStrides;
   int64_t srcOffset, targetOffset;
@@ -89,24 +104,38 @@ bool createDMAStartOp(Location loc, IRRewriter &rewriter, Value source,
   Value numElements = createNumElements(loc, rewriter, source);
   if (rank == 1 || (isContiguousMemrefType(sourceMemRefType) &&
                     isContiguousMemrefType(targetMemRefType))) {
-
-    auto dmaStart =
-        memref::DmaStartOp::create(rewriter, loc, source, zeroIndices, target,
-                                   zeroIndices, numElements, tagAlloc, zeroIndex);
+    OperationState state(loc, "memref_ext.dma_start");
+    state.addOperands({source, target, numElements, tagAlloc});
+    Operation *dmaStart = rewriter.create(state);
     if (createdOp)
-      *createdOp = dmaStart.getOperation();
+      *createdOp = dmaStart;
     return true;
   }
 
-  int64_t stride, width;
-  assert(isStridedMultiDimMemrefType(sourceMemRefType, stride, width) ||
-         isStridedMultiDimMemrefType(targetMemRefType, stride, width));
-  auto dmaStart = memref::DmaStartOp::create(
-      rewriter, loc, source, zeroIndices, target, zeroIndices, numElements,
-      tagAlloc, zeroIndex, getI32Const(loc, rewriter, stride),
-      getI32Const(loc, rewriter, width));
+  Value width;
+  int64_t sourceStride = 0;
+  int64_t targetStride = 0;
+  bool sourceStrided = getStaticOuterStride(sourceMemRefType, sourceStride);
+  bool targetStrided = getStaticOuterStride(targetMemRefType, targetStride);
+
+  if (sourceStrided) {
+    width = getInnermostDim(loc, rewriter, source);
+  } else if (targetStrided) {
+    width = getInnermostDim(loc, rewriter, target);
+  } else {
+    return false;
+  }
+
+  OperationState state(loc, "memref_ext.dma_2d_start");
+  Value srcStride = sourceStrided ? getI32Const(loc, rewriter, sourceStride)
+                                  : width;
+  Value dstStride = targetStrided ? getI32Const(loc, rewriter, targetStride)
+                                  : width;
+  state.addOperands(
+      {source, target, numElements, tagAlloc, srcStride, dstStride, width});
+  Operation *dmaStart = rewriter.create(state);
   if (createdOp)
-    *createdOp = dmaStart.getOperation();
+    *createdOp = dmaStart;
   return true;
 }
 

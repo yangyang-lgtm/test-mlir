@@ -17,6 +17,7 @@
 // 后续可扩展支持更多场景，例如更高维 DMA、多缓冲策略和更广的模式覆盖。
 //===----------------------------------------------------------------------===//
 
+#include "hexagon/Common/Common.h"
 #include "hexagon/Transforms/CopyDirection.h"
 #include "hexagon/Transforms/Passes.h"
 
@@ -1046,7 +1047,7 @@ void rewriteAsDoubleBuffered(IRRewriter &rewriter, scf::ForOp sbForOp,
                               /*markCompute=*/false);
     // 克隆原 load copy，并标记为 prefetch。
     cloneCopyWithMappedSlices(schedule.triplets[i].load, rewriter, mapping,
-                              sbForOp.getBody(), "prefetch");
+                              sbForOp.getBody(), kPrefetchRole);
   }
 
   // Kernel：通过 loop-carried selector 选择 current buffer，而不是分别克隆
@@ -1137,7 +1138,7 @@ void rewriteAsDoubleBuffered(IRRewriter &rewriter, scf::ForOp sbForOp,
                               /*markCompute=*/false);
     // 克隆 load copy，仍标记为 prefetch。
     cloneCopyWithMappedSlices(schedule.triplets[i].load, rewriter, mapping,
-                              sbForOp.getBody(), "prefetch");
+                              sbForOp.getBody(), kPrefetchRole);
   }
 
   // 在下一轮 tile prefetch 启动后，计算并写回当前 tile。S2 会在这个边界插入

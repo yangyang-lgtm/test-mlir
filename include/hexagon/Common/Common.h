@@ -18,6 +18,24 @@
 namespace mlir {
 namespace hexagon {
 
+constexpr StringLiteral kLoopKindAttr = "db_loop_kind";
+constexpr StringLiteral kTiledGenericAttr = "tiled_generic";
+constexpr StringLiteral kPointwise = "pointwise";
+constexpr StringLiteral kReduce = "reduce";
+constexpr StringLiteral kPrefetchRole = "prefetch";
+constexpr StringLiteral kDB2GroupAttr = "db2.group";
+constexpr StringLiteral kDB2KernelAttr = "db2.kernel";
+constexpr StringLiteral kDB2PrologueAttr = "db2.prologue";
+constexpr StringLiteral kDB2PrefetchAttr = "db2.prefetch";
+constexpr StringLiteral kDB2RoleAttr = "db2.role";
+constexpr StringLiteral kDB2StageAttr = "db2.stage";
+constexpr StringLiteral kDB2TileAttr = "db2.tile";
+constexpr StringLiteral kDB2ComputeAttr = "db2.compute";
+constexpr StringLiteral kDB2PrefetchRole = kPrefetchRole;
+constexpr StringLiteral kDB2StoreRole = "store";
+constexpr StringLiteral kDB2PrologueStage = "prologue";
+constexpr StringLiteral kDB2KernelStage = "kernel";
+
 inline constexpr unsigned DEFAULT_DDR_ADDRESS_SPACE = 0;
 inline constexpr unsigned VTCM_ADDRESS_SPACE = 1;
 

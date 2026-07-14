@@ -372,6 +372,7 @@ public:
       // Erase unnecessary vector-to-tensor writeback in loops before
       // bufferization.
       pm.addNestedPass<func::FuncOp>(createEraseVectorToTensorWritebackPass());
+      pm.addNestedPass<func::FuncOp>(createAnnotateForLoopKindPass());
       pm.addNestedPass<func::FuncOp>(
           createSetTensorAllocSharedMemoryPass());
 
@@ -384,9 +385,10 @@ public:
 
       if (enableDoubleBuffering) {
         pm.addNestedPass<func::FuncOp>(createAnnotateMemrefCopyDirectionPass());
-        pm.addNestedPass<func::FuncOp>(createHoistDoubleBufferCopyInsPass());
         pm.addNestedPass<func::FuncOp>(
-            createHexagonDoubleBufferGenericS1Pass());
+            createScheduleDoubleBufferCopiesPass());
+        pm.addNestedPass<func::FuncOp>(
+            createHexagonDoubleBufferPlanRewritePass());
       }
 
       pm.addNestedPass<func::FuncOp>(
@@ -401,7 +403,7 @@ public:
       pm.addPass(createCSEPass());
       if (enableDoubleBuffering) {
         pm.addNestedPass<func::FuncOp>(
-            createHexagonDoubleBufferGenericS2Pass());
+            createHexagonDoubleBufferDMALoweringPass());
       }
       pm.addNestedPass<func::FuncOp>(createPlanSharedMemoryPass());
 

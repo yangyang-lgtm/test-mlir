@@ -45,6 +45,31 @@ def AnnotateMemrefCopyDirection :
        "hexagon::createAnnotateMemrefCopyDirectionPass()";
 }
 
+def ScheduleDoubleBufferCopies :
+    Pass<"schedule-double-buffer-copies", "func::FuncOp"> {
+  let summary = "Schedule double-buffer copies around tile computation";
+  let description = [{
+    Uses local memory data-flow information to move `global_to_shared`
+    memref.copy operations as early as legal and `shared_to_global` memref.copy
+    operations as late as legal. The pass preserves copy order when aliasing or
+    unknown side effects make a move unsafe.
+  }];
+  let constructor =
+       "hexagon::createScheduleDoubleBufferCopiesPass()";
+}
+
+def AnnotateForLoopKind :
+    Pass<"annotate-for-loop-kind", "func::FuncOp"> {
+  let summary = "Annotate tensor scf.for loops as pointwise or reduce";
+  let description = [{
+    Runs before bufferization and annotates recognizable tensor `scf.for`
+    loops with `db_loop_kind = "pointwise"` or `db_loop_kind = "reduce"`.
+    Unknown loop shapes are left unannotated.
+  }];
+  let constructor =
+       "hexagon::createAnnotateForLoopKindPass()";
+}
+
 def SetTensorAllocSharedMemory :
     Pass<"set-tensor-alloc-shared-memory", "func::FuncOp"> {
   let summary = "Place all bufferized tensor allocations in shared memory";
@@ -193,6 +218,20 @@ def HexagonDoubleBufferGenericS1 :
        "hexagon::createHexagonDoubleBufferGenericS1Pass()";
 }
 
+def HexagonDoubleBufferPlanRewrite :
+    InterfacePass<"hexagon-double-buffer-plan-rewrite",
+                  "mlir::FunctionOpInterface"> {
+  let summary = "Plan and rewrite eligible scf.for loops for double buffering";
+
+  let description = [{
+    Builds a local tile-dependence plan for an eligible single-buffer loop and
+    rewrites it directly into a double-buffered prologue/kernel structure. This
+    replaces the old pre-hoist + generic S1 pipeline entry.
+  }];
+  let constructor =
+       "hexagon::createHexagonDoubleBufferPlanRewritePass()";
+}
+
 def HexagonDoubleBufferGenericS2 :
     InterfacePass<"hexagon-double-buffer-generic-s2",
                   "mlir::FunctionOpInterface"> {
@@ -210,6 +249,21 @@ def HexagonDoubleBufferGenericS2 :
   }];
   let constructor =
        "hexagon::createHexagonDoubleBufferGenericS2Pass()";
+}
+
+def HexagonDoubleBufferDMALowering :
+    InterfacePass<"hexagon-double-buffer-dma-lowering",
+                  "mlir::FunctionOpInterface"> {
+  let summary = "Lower planned double-buffer copies to DMA operations";
+
+  let description = [{
+    Consumes the explicit metadata emitted by
+    hexagon-double-buffer-plan-rewrite and mechanically lowers planned
+    prefetch/store memref.copy operations to memref.dma_start/wait.
+    This replaces the old generic S2 pipeline entry.
+  }];
+  let constructor =
+       "hexagon::createHexagonDoubleBufferDMALoweringPass()";
 }
 
 def HexagonLowerTmTensor :
