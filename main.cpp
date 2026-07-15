@@ -151,23 +151,23 @@ int main(int argc, char **argv) {
         mlir::hexagon::createAnnotateMemrefCopyDirectionPass());
     manager.addNestedPass<mlir::func::FuncOp>(
         mlir::hexagon::createScheduleDoubleBufferCopiesPass());
-    manager.addNestedPass<mlir::func::FuncOp>(
-        mlir::hexagon::createHexagonDoubleBufferPlanRewritePass());
-    manager.addNestedPass<mlir::func::FuncOp>(mlir::bufferization::createBufferLoopHoistingPass());
-
-    manager.addNestedPass<mlir::func::FuncOp>(mlir::hexagon::createCopyCanonicalizationPass());
-    manager.addPass(mlir::createCanonicalizerPass());
-
-    mlir::bufferization::buildBufferDeallocationPipeline(
-        manager, mlir::bufferization::BufferDeallocationPipelineOptions{});
-    manager.addPass(mlir::createCSEPass());
-
-    manager.addNestedPass<mlir::func::FuncOp>(
-        mlir::hexagon::createHexagonDoubleBufferDMALoweringPass());
-    manager.addNestedPass<mlir::func::FuncOp>(
-        mlir::hexagon::createPlanSharedMemoryPass());
-    manager.addNestedPass<mlir::func::FuncOp>(mlir::hexagon::createConvertZeroSizeMemrefPass());
-    manager.addPass(mlir::createConvertBufferizationToMemRefPass());
+    // manager.addNestedPass<mlir::func::FuncOp>(
+    //     mlir::hexagon::createHexagonDoubleBufferPlanRewritePass());
+    // manager.addNestedPass<mlir::func::FuncOp>(mlir::bufferization::createBufferLoopHoistingPass());
+    //
+    // manager.addNestedPass<mlir::func::FuncOp>(mlir::hexagon::createCopyCanonicalizationPass());
+    // manager.addPass(mlir::createCanonicalizerPass());
+    //
+    // mlir::bufferization::buildBufferDeallocationPipeline(
+    //     manager, mlir::bufferization::BufferDeallocationPipelineOptions{});
+    // manager.addPass(mlir::createCSEPass());
+    //
+    // manager.addNestedPass<mlir::func::FuncOp>(
+    //     mlir::hexagon::createHexagonDoubleBufferDMALoweringPass());
+    // manager.addNestedPass<mlir::func::FuncOp>(
+    //     mlir::hexagon::createPlanSharedMemoryPass());
+    // manager.addNestedPass<mlir::func::FuncOp>(mlir::hexagon::createConvertZeroSizeMemrefPass());
+    // manager.addPass(mlir::createConvertBufferizationToMemRefPass());
   }
 
   manager.addPass(mlir::createCanonicalizerPass());

@@ -17,6 +17,21 @@
 
 #include "hexagon/Dialect/MemRefExt/IR/MemRefExtDialect.h.inc"
 
+namespace mlir {
+namespace memref_ext {
+
+struct DmaHandleResource
+    : public SideEffects::Resource::Base<DmaHandleResource> {
+  StringRef getName() final { return "<DmaHandle>"; }
+};
+
+struct DmaSyncResource : public SideEffects::Resource::Base<DmaSyncResource> {
+  StringRef getName() final { return "<DmaSync>"; }
+};
+
+} // namespace memref_ext
+} // namespace mlir
+
 #define GET_TYPEDEF_CLASSES
 #include "hexagon/Dialect/MemRefExt/IR/MemRefExtTypes.h.inc"
 

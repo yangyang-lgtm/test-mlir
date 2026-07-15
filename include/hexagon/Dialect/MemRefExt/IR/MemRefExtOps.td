@@ -22,7 +22,9 @@ def MemRefExt_DmaHandleOp : MemRefExt_Op<"dma_handle"> {
 
   let description = [{
     Creates a DMA handle SSA value. The handle is used by dma_start and
-    dma_wait to keep ping and pong DMA synchronization tokens independent.
+    dma_wait to group asynchronous DMA transfers that must be synchronized
+    together. Independent handles keep ping and pong synchronization state
+    independent.
   }];
 
   let results = (outs MemRefExt_DmaHandle:$handle);
@@ -30,12 +32,16 @@ def MemRefExt_DmaHandleOp : MemRefExt_Op<"dma_handle"> {
   let assemblyFormat = "attr-dict `:` type($handle)";
 }
 
-def MemRefExt_DmaStartOp : MemRefExt_Op<"dma_start"> {
+def MemRefExt_DmaStartOp : MemRefExt_Op<"dma_start", [
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>
+  ]> {
   let summary = "Start a DMA transfer using an explicit DMA handle";
 
   let description = [{
-    Starts an asynchronous contiguous DMA transfer and records the runtime DMA
-    token in the given DmaHandle. This is intentionally simpler than
+    Starts an asynchronous contiguous DMA transfer and updates the runtime DMA
+    state associated with the given DmaHandle. Multiple starts may use the same
+    handle and a later dma_wait on that handle synchronizes the grouped
+    transfers. This is intentionally simpler than
     `memref.dma_start`: the transfer starts at zero indices of source and
     target, and the handle is passed directly so ping/pong phases can use
     independent DmaHandle values.
@@ -43,10 +49,8 @@ def MemRefExt_DmaStartOp : MemRefExt_Op<"dma_start"> {
     `num_elements` is in elements.
   }];
 
-  let arguments = (ins Arg<AnyMemRef, "source memref",
-                           [MemReadAt<0, FullEffect>]>:$source,
-                       Arg<AnyMemRef, "target memref",
-                           [MemWriteAt<0, FullEffect>]>:$target,
+  let arguments = (ins Arg<AnyMemRef, "source memref">:$source,
+                       Arg<AnyMemRef, "target memref">:$target,
                        Index:$num_elements,
                        Arg<MemRefExt_DmaHandle, "DMA handle">:$handle);
 
@@ -56,23 +60,24 @@ def MemRefExt_DmaStartOp : MemRefExt_Op<"dma_start"> {
   }];
 }
 
-def MemRefExt_Dma2DStartOp : MemRefExt_Op<"dma_2d_start"> {
+def MemRefExt_Dma2DStartOp : MemRefExt_Op<"dma_2d_start", [
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>
+  ]> {
   let summary = "Start a 2D DMA transfer using an explicit DMA handle";
 
   let description = [{
-    Starts an asynchronous 2D DMA transfer and records the runtime DMA token in
-    the given DmaHandle. Unlike `memref.dma_start`, this op explicitly carries both
-    source and target row strides, so it can represent copies where either side
-    is pitched and ping/pong phases can use independent DmaHandle values.
+    Starts an asynchronous 2D DMA transfer and updates the runtime DMA state
+    associated with the given DmaHandle. Unlike `memref.dma_start`, this op
+    explicitly carries both source and target row strides, so it can represent
+    copies where either side is pitched and ping/pong phases can use independent
+    DmaHandle values.
 
     `num_elements`, `src_stride`, `dst_stride`, and `width` are all in elements.
     The transfer starts at zero indices of source and target.
   }];
 
-  let arguments = (ins Arg<AnyMemRef, "source memref",
-                           [MemReadAt<0, FullEffect>]>:$source,
-                       Arg<AnyMemRef, "target memref",
-                           [MemWriteAt<0, FullEffect>]>:$target,
+  let arguments = (ins Arg<AnyMemRef, "source memref">:$source,
+                       Arg<AnyMemRef, "target memref">:$target,
                        Index:$num_elements,
                        Arg<MemRefExt_DmaHandle, "DMA handle">:$handle,
                        Index:$src_stride,
@@ -86,11 +91,13 @@ def MemRefExt_Dma2DStartOp : MemRefExt_Op<"dma_2d_start"> {
   }];
 }
 
-def MemRefExt_DmaWaitOp : MemRefExt_Op<"dma_wait"> {
+def MemRefExt_DmaWaitOp : MemRefExt_Op<"dma_wait", [
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>
+  ]> {
   let summary = "Wait for a DMA handle";
 
   let description = [{
-    Waits for the DMA transfer token currently recorded in the given DmaHandle.
+    Waits for the DMA transfers grouped by the given DmaHandle.
   }];
 
   let arguments = (ins Arg<MemRefExt_DmaHandle, "DMA handle">:$handle);
