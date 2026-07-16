@@ -8,6 +8,7 @@
 #include "hexagon/Common/Common.h"
 #include "hexagon/Transforms/CopyDirection.h"
 #include "hexagon/Transforms/Passes.h"
+#include "triton/Dialect/Triton/IR/Dialect.h"
 
 #include "mlir/Analysis/AliasAnalysis.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -42,14 +43,6 @@ bool isLoadCopy(memref::CopyOp copy) {
 // shared -> global 的 copy 视为 store。
 bool isStoreCopy(memref::CopyOp copy) {
   return hasCopyDirection(copy, kSharedToGlobal);
-}
-
-// 判断一个操作是否是本 pass 需要调度的 load/store copy。
-bool isScheduledCopy(Operation *op) {
-  // 只处理 memref.copy。
-  auto copy = dyn_cast<memref::CopyOp>(op);
-  // load copy 和 store copy 都属于调度目标。
-  return copy && (isLoadCopy(copy) || isStoreCopy(copy));
 }
 
 // 数据流节点的角色，用于打印和调度分类。
@@ -93,6 +86,16 @@ struct DataFlowNode {
   bool hasUnknownMemoryEffect = false;
 };
 
+// analysis 产出的可执行 copy 调度计划。
+struct CopyScheduleMove {
+  // 被移动的 copy。
+  memref::CopyOp copy;
+  // copy 最终插入到该 op 之前。
+  Operation *insertionPoint = nullptr;
+  // load 提前时需要一起移动的地址计算依赖。
+  SmallVector<Operation *> movableDefs;
+};
+
 // 沿着 subview/cast/view 链找到用于别名判断的根 memref。
 Value findMemoryRoot(Value value) {
   // 不断剥离只改变视图或类型的操作。
@@ -120,6 +123,11 @@ Value findMemoryRoot(Value value) {
     // view 的底层存储来自 source。
     if (auto view = dyn_cast<memref::ViewOp>(def)) {
       value = view.getSource();
+      continue;
+    }
+    // tt.addptr 只改变 pointer offset，底层内存根来自 ptr operand。
+    if (auto addPtr = dyn_cast<triton::AddPtrOp>(def)) {
+      value = addPtr.getPtr();
       continue;
     }
 
@@ -153,6 +161,11 @@ StringRef stringifyAccess(bool reads, bool writes) {
   if (writes)
     return "WRITE";
   return "NO_ACCESS";
+}
+
+// load/store copy 之间保持原始相对顺序，避免调度迭代来回翻转。
+bool isCopyRole(ScheduleRole role) {
+  return role == ScheduleRole::Load || role == ScheduleRole::Store;
 }
 
 // 向访问列表中加入或合并某个 tile 的读写信息。
@@ -227,6 +240,21 @@ public:
 
   // 判断当前数据流图是否为空。
   bool empty() const { return nodes.empty(); }
+
+  // 基于 build() 得到的数据流依赖，将 load copy 提到最早合法位置。
+  bool hoistLoadAsEarlyAsPossible(memref::CopyOp copy) const;
+
+  // 基于 build() 得到的数据流依赖，将 store copy 下沉到最晚合法位置。
+  bool sinkStoreAsLateAsPossible(memref::CopyOp copy) const;
+
+  // 返回 load copy 的可执行提前计划；不可移动时返回 nullopt。
+  std::optional<CopyScheduleMove> getLoadMove(memref::CopyOp copy) const;
+
+  // 返回 store copy 的可执行下沉计划；不可移动时返回 nullopt。
+  std::optional<CopyScheduleMove> getStoreMove(memref::CopyOp copy) const;
+
+  // 执行 analysis 产出的调度计划。
+  void applyMove(const CopyScheduleMove &move) const;
 
   // 打印数据流图，帮助观察调度前后的依赖关系。
   void print(raw_ostream &os, StringRef title) const {
@@ -395,7 +423,8 @@ private:
     for (auto [nodeIndex, node] : llvm::enumerate(nodes)) {
       // 当前节点的依赖边先临时收集，最后排序。
       SmallVector<DataFlowEdge> edges;
-      for (const DataFlowAccess &access : node.accesses) {
+      SmallVector<DataFlowAccess> accesses = getDependencyAccesses(node);
+      for (const DataFlowAccess &access : accesses) {
         // 取出当前节点对这个 tile 的访问方式。
         bool reads = access.reads;
         bool writes = access.writes;
@@ -437,6 +466,18 @@ private:
     }
   }
 
+  // unknown memory effect 保守看作读写所有已知 tile，作为调度屏障参与依赖。
+  SmallVector<DataFlowAccess> getDependencyAccesses(
+      const DataFlowNode &node) const {
+    SmallVector<DataFlowAccess> accesses(node.accesses);
+    if (!node.hasUnknownMemoryEffect)
+      return accesses;
+
+    for (auto [tileIndex, tile] : llvm::enumerate(tileRoots))
+      addAccess(accesses, tileIndex, /*reads=*/true, /*writes=*/true);
+    return accesses;
+  }
+
   // 向边集合加入一条边；若已有同 predecessor/tile，则合并依赖类型。
   void addOrMergeEdge(SmallVectorImpl<DataFlowEdge> &edges,
                       unsigned predecessor, unsigned tileIndex, bool raw,
@@ -469,6 +510,58 @@ private:
     llvm::raw_string_ostream os(result);
     llvm::interleave(kinds, os, "+");
     return result;
+  }
+
+  // load copy 不能越过任何数据流前驱；返回第一个可尝试插入的位置。
+  Operation *getLoadAnchor(memref::CopyOp copy) const {
+    std::optional<unsigned> nodeIndex = getNodeIndex(copy);
+    if (!nodeIndex)
+      return nullptr;
+
+    std::optional<unsigned> latestBarrier;
+    for (const DataFlowEdge &edge : nodes[*nodeIndex].predecessors) {
+      if (!latestBarrier || edge.predecessor > *latestBarrier)
+        latestBarrier = edge.predecessor;
+    }
+
+    for (unsigned index = 0; index < *nodeIndex; ++index) {
+      if (!isCopyRole(nodes[index].role))
+        continue;
+      if (!latestBarrier || index > *latestBarrier)
+        latestBarrier = index;
+    }
+
+    if (!latestBarrier)
+      return &block.front();
+    return nodes[*latestBarrier].op->getNextNode();
+  }
+
+  // store copy 不能越过任何数据流后继；返回下沉后的插入点。
+  Operation *getStoreInsertionPoint(memref::CopyOp copy) const {
+    std::optional<unsigned> nodeIndex = getNodeIndex(copy);
+    if (!nodeIndex)
+      return nullptr;
+
+    std::optional<unsigned> earliestBarrier;
+    for (auto [successorIndex, node] : llvm::enumerate(nodes)) {
+      if (successorIndex <= *nodeIndex)
+        continue;
+      if (isCopyRole(node.role)) {
+        if (!earliestBarrier || successorIndex < *earliestBarrier)
+          earliestBarrier = successorIndex;
+        continue;
+      }
+      for (const DataFlowEdge &edge : node.predecessors) {
+        if (edge.predecessor != *nodeIndex)
+          continue;
+        if (!earliestBarrier || successorIndex < *earliestBarrier)
+          earliestBarrier = successorIndex;
+      }
+    }
+
+    if (!earliestBarrier)
+      return block.getTerminator();
+    return nodes[*earliestBarrier].op;
   }
 
   // 被分析的 block。
@@ -518,10 +611,6 @@ bool collectMovableDefs(Value value, Block *block, Operation *anchor,
 // 判断 copy 跨过某个 op 时是否会破坏内存语义。
 bool hasConflictWhenCrossing(Operation *op, Value source, Value target,
                              AliasAnalysis &aliasAnalysis) {
-  // 不允许跨过其它被调度的 copy，避免打乱 copy 间显式顺序。
-  if (isScheduledCopy(op))
-    return true;
-
   // source/target 规约到根，用于别名判断。
   source = findMemoryRoot(source);
   target = findMemoryRoot(target);
@@ -565,20 +654,22 @@ bool hasConflictWhenCrossing(Operation *op, Value source, Value target,
   return false;
 }
 
-// 尝试把 load copy 提到 anchor 之前。
-bool hoistLoadBefore(memref::CopyOp copy, Operation *anchor,
-                     AliasAnalysis &aliasAnalysis) {
-  // anchor 必须和 copy 在同一 block，且位于 copy 之前。
-  if (copy == anchor || anchor->getBlock() != copy->getBlock() ||
-      !anchor->isBeforeInBlock(copy))
-    return false;
+std::optional<CopyScheduleMove>
+CopyScheduleDataFlowAnalysis::getLoadMove(memref::CopyOp copy) const {
+  // 只通过本次 build() 中的节点调度，避免外部 copy 绕过数据流依赖。
+  if (copy->getBlock() != &block || !isLoadCopy(copy))
+    return std::nullopt;
+
+  Operation *anchor = getLoadAnchor(copy);
+  if (!anchor || anchor == copy || !anchor->isBeforeInBlock(copy))
+    return std::nullopt;
 
   // 收集 source/target 地址计算所需、需要一起提前的定义操作。
-  Block *block = copy->getBlock();
   llvm::SetVector<Operation *> movableOps;
-  if (!collectMovableDefs(copy.getSource(), block, anchor, copy, movableOps) ||
-      !collectMovableDefs(copy.getTarget(), block, anchor, copy, movableOps))
-    return false;
+  if (!collectMovableDefs(copy.getSource(), &block, anchor, copy,
+                          movableOps) ||
+      !collectMovableDefs(copy.getTarget(), &block, anchor, copy, movableOps))
+    return std::nullopt;
 
   // 检查 copy 从原位置移动到 anchor 前会跨过的所有操作。
   for (Operation *current = anchor; current && current != copy;
@@ -589,85 +680,67 @@ bool hoistLoadBefore(memref::CopyOp copy, Operation *anchor,
     // 遇到内存冲突就不能提前。
     if (hasConflictWhenCrossing(current, copy.getSource(), copy.getTarget(),
                                 aliasAnalysis))
-      return false;
+      return std::nullopt;
   }
 
-  // 先移动地址计算依赖，再移动 copy 本身。
-  for (Operation *op : movableOps)
-    op->moveBefore(anchor);
-  copy->moveBefore(anchor);
-  return true;
+  CopyScheduleMove move;
+  move.copy = copy;
+  move.insertionPoint = anchor;
+  move.movableDefs.assign(movableOps.begin(), movableOps.end());
+  return move;
 }
 
-// 从 block 开头开始尝试，将 load copy 提到最早合法位置。
-bool hoistLoadAsEarlyAsPossible(memref::CopyOp copy,
-                                AliasAnalysis &aliasAnalysis) {
-  // 先快照 copy 之前的所有潜在 anchor，避免移动时迭代器失效。
-  SmallVector<Operation *> anchors;
-  for (Operation *op = &copy->getBlock()->front(); op && op != copy;
-       op = op->getNextNode())
-    anchors.push_back(op);
+std::optional<CopyScheduleMove>
+CopyScheduleDataFlowAnalysis::getStoreMove(memref::CopyOp copy) const {
+  // 只通过本次 build() 中的节点调度，避免外部 copy 绕过数据流依赖。
+  if (copy->getBlock() != &block || !isStoreCopy(copy))
+    return std::nullopt;
 
-  // 找到第一个可行 anchor 就完成最早提前。
-  for (Operation *anchor : anchors)
-    if (anchor->getBlock() == copy->getBlock() &&
-        anchor->isBeforeInBlock(copy) &&
-        hoistLoadBefore(copy, anchor, aliasAnalysis))
-      return true;
+  Operation *insertionPoint = getStoreInsertionPoint(copy);
+  if (!insertionPoint || insertionPoint == copy ||
+      insertionPoint == copy->getNextNode() ||
+      !copy->isBeforeInBlock(insertionPoint))
+    return std::nullopt;
 
-  // 没有找到合法提前位置。
-  return false;
-}
-
-// 尝试把 store copy 下沉到 insertAfter 之后。
-bool sinkStoreAfter(memref::CopyOp copy, Operation *insertAfter,
-                    AliasAnalysis &aliasAnalysis) {
-  // insertAfter 必须和 copy 在同一 block，且位于 copy 之后。
-  if (copy == insertAfter || insertAfter->getBlock() != copy->getBlock() ||
-      !copy->isBeforeInBlock(insertAfter))
-    return false;
-
-  // 检查从 copy 之后到 insertAfter 之前的跨越操作。
-  for (Operation *current = copy->getNextNode(); current && current != nullptr;
-       current = current->getNextNode()) {
-    if (current == insertAfter)
-      break;
-    // 任一内存冲突都会阻止下沉。
+  // 只检查实际跨过的操作；insertionPoint 本身仍位于 store 之后，不能跨过。
+  for (Operation *current = copy->getNextNode(); current &&
+       current != insertionPoint; current = current->getNextNode()) {
     if (hasConflictWhenCrossing(current, copy.getSource(), copy.getTarget(),
                                 aliasAnalysis))
-      return false;
+      return std::nullopt;
   }
-  // store 下沉到 insertAfter 之后也等价于跨过 insertAfter 本身。
-  if (hasConflictWhenCrossing(insertAfter, copy.getSource(), copy.getTarget(),
-                              aliasAnalysis))
+
+  CopyScheduleMove move;
+  move.copy = copy;
+  move.insertionPoint = insertionPoint;
+  return move;
+}
+
+void CopyScheduleDataFlowAnalysis::applyMove(
+    const CopyScheduleMove &move) const {
+  for (Operation *op : move.movableDefs)
+    op->moveBefore(move.insertionPoint);
+  move.copy->moveBefore(move.insertionPoint);
+}
+
+bool CopyScheduleDataFlowAnalysis::hoistLoadAsEarlyAsPossible(
+    memref::CopyOp copy) const {
+  std::optional<CopyScheduleMove> move = getLoadMove(copy);
+  if (!move)
     return false;
 
-  // 将 copy 移动到 insertAfter 的下一个节点之前。
-  copy->moveBefore(insertAfter->getNextNode());
+  applyMove(*move);
   return true;
 }
 
-// 尽量把 store copy 下沉到 block 末尾前的最后合法位置。
-bool sinkStoreAsLateAsPossible(memref::CopyOp copy,
-                               AliasAnalysis &aliasAnalysis) {
-  // terminator 不能被跨过，store 最多下沉到 terminator 之前。
-  Operation *terminator = copy->getBlock()->getTerminator();
-  // 记录目前发现的最后一个可跨越操作。
-  Operation *lastLegal = nullptr;
-  for (Operation *op = copy->getNextNode(); op && op != terminator;
-       op = op->getNextNode()) {
-    // 遇到冲突后停止，不能继续下沉。
-    if (hasConflictWhenCrossing(op, copy.getSource(), copy.getTarget(),
-                                aliasAnalysis))
-      break;
-    lastLegal = op;
-  }
-
-  // 没有可跨越操作则无需移动。
-  if (!lastLegal)
+bool CopyScheduleDataFlowAnalysis::sinkStoreAsLateAsPossible(
+    memref::CopyOp copy) const {
+  std::optional<CopyScheduleMove> move = getStoreMove(copy);
+  if (!move)
     return false;
-  // 真正执行移动。
-  return sinkStoreAfter(copy, lastLegal, aliasAnalysis);
+
+  applyMove(*move);
+  return true;
 }
 
 // 对一个循环体 block 执行 copy 调度：load 尽量提前，store 尽量延后。
@@ -697,7 +770,7 @@ bool scheduleBlock(Block &block, AliasAnalysis &aliasAnalysis) {
     for (memref::CopyOp copy : analysis.getLoads()) {
       if (copy->getBlock() != &block)
         continue;
-      if (hoistLoadAsEarlyAsPossible(copy, aliasAnalysis)) {
+      if (analysis.hoistLoadAsEarlyAsPossible(copy)) {
         localChanged = true;
         changed = true;
       }
@@ -710,7 +783,7 @@ bool scheduleBlock(Block &block, AliasAnalysis &aliasAnalysis) {
     for (memref::CopyOp copy : llvm::reverse(analysis.getStores())) {
       if (copy->getBlock() != &block)
         continue;
-      if (sinkStoreAsLateAsPossible(copy, aliasAnalysis)) {
+      if (analysis.sinkStoreAsLateAsPossible(copy)) {
         localChanged = true;
         changed = true;
       }

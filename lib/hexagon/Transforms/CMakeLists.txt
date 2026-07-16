@@ -1,9 +1,12 @@
 add_mlir_library(Transforms
   AnnotateMemrefCopyDirectionPass.cpp
   ScheduleDoubleBufferCopiesPass.cpp
+  ScheduleDoubleBufferLoadStoreExtPass.cpp
   AnnotateForLoopKindPass.cpp
   DoubleBufferPlanRewritePass.cpp
+  DoubleBufferPlanRewriteExtPass.cpp
   DoubleBufferDMALoweringPass.cpp
+  DoubleBufferDMALoweringExtPass.cpp
   SetTensorAllocSharedMemoryPass.cpp
   PlanSharedMemoryPass.cpp
   HoistDoubleBufferCopyInsPass.cpp

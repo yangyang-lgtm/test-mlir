@@ -8,4 +8,5 @@ add_mlir_dialect_library(MemRefExt
 
   LINK_LIBS PUBLIC
   MLIRIR
+  TritonIR
 )

@@ -27,6 +27,9 @@ createAnnotateMemrefCopyDirectionPass();
 std::unique_ptr<OperationPass<func::FuncOp>>
 createScheduleDoubleBufferCopiesPass();
 
+std::unique_ptr<OperationPass<func::FuncOp>>
+createScheduleDoubleBufferLoadStoreExtPass();
+
 std::unique_ptr<OperationPass<func::FuncOp>> createAnnotateForLoopKindPass();
 
 std::unique_ptr<OperationPass<func::FuncOp>>
@@ -71,7 +74,13 @@ std::unique_ptr<InterfacePass<FunctionOpInterface>>
 createHexagonDoubleBufferPlanRewritePass();
 
 std::unique_ptr<InterfacePass<FunctionOpInterface>>
+createHexagonDoubleBufferPlanRewriteExtPass();
+
+std::unique_ptr<InterfacePass<FunctionOpInterface>>
 createHexagonDoubleBufferDMALoweringPass();
+
+std::unique_ptr<InterfacePass<FunctionOpInterface>>
+createHexagonDoubleBufferDMALoweringExtPass();
 
 std::unique_ptr<OperationPass<ModuleOp>>
 createHexagonLLVMEnableHexagonRoutinesPass();

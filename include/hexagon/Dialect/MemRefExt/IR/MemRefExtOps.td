@@ -12,6 +12,7 @@ include "mlir/IR/CommonTypeConstraints.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 include "hexagon/Dialect/MemRefExt/IR/MemRefExtDialect.td"
 include "hexagon/Dialect/MemRefExt/IR/MemRefExtTypes.td"
+include "triton/Dialect/Triton/IR/TritonTypes.td"
 
 class MemRefExt_Op<string mnemonic, list<Trait> traits = []> :
     Op<MemRefExt_Dialect, mnemonic, traits> {
@@ -49,10 +50,11 @@ def MemRefExt_DmaStartOp : MemRefExt_Op<"dma_start", [
     `num_elements` is in elements.
   }];
 
-  let arguments = (ins Arg<AnyMemRef, "source memref">:$source,
-                       Arg<AnyMemRef, "target memref">:$target,
+  let arguments = (ins Arg<AnyType, "source memory object">:$source,
+                       Arg<AnyType, "target memory object">:$target,
                        Index:$num_elements,
                        Arg<MemRefExt_DmaHandle, "DMA handle">:$handle);
+  let hasVerifier = 1;
 
   let assemblyFormat = [{
     $source `,` $target `,` $num_elements `,` $handle attr-dict
@@ -91,6 +93,34 @@ def MemRefExt_Dma2DStartOp : MemRefExt_Op<"dma_2d_start", [
   }];
 }
 
+def MemRefExt_DmaStartExOp : MemRefExt_Op<"dma_start_ex", [
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>
+  ]> {
+  let summary = "Start an asynchronous bounded external load";
+
+  let description = [{
+    Asynchronously loads up to `valid_elements` elements from an external
+    pointer-like value into `target`, using the same bounded-load operands as
+    `memref_ext.load_ex`. The explicit DMA handle groups the asynchronous
+    transfer for a later `memref_ext.dma_wait`.
+  }];
+
+  let arguments = (ins Arg<AnyType, "external pointer">:$ptr,
+                       I32Attr:$tensor_size,
+                       TT_Int:$valid_size,
+                       TT_Type:$other,
+                       Arg<AnyMemRef, "target memref">:$target,
+                       OptionalAttr<BoolAttr>:$is_other_valid,
+                       Arg<MemRefExt_DmaHandle, "DMA handle">:$handle);
+  let hasVerifier = 1;
+
+  let assemblyFormat = [{
+    $ptr `,` $valid_size `,` $other `,` $target `,` $handle attr-dict
+    `:` type($ptr) `,` type($valid_size) `,` type($other) `,`
+    type($target) `,` type($handle)
+  }];
+}
+
 def MemRefExt_DmaWaitOp : MemRefExt_Op<"dma_wait", [
     DeclareOpInterfaceMethods<MemoryEffectsOpInterface>
   ]> {
@@ -103,6 +133,74 @@ def MemRefExt_DmaWaitOp : MemRefExt_Op<"dma_wait", [
   let arguments = (ins Arg<MemRefExt_DmaHandle, "DMA handle">:$handle);
 
   let assemblyFormat = "$handle attr-dict `:` type($handle)";
+}
+
+def MemRefExt_SelectMemrefOp : MemRefExt_Op<"select_memref", [Pure]> {
+  let summary = "Select between two memref values";
+
+  let description = [{
+    Selects `true_value` when `condition` is true and `false_value` otherwise.
+    Both memref operands and the result must have the same type.
+  }];
+
+  let arguments = (ins I1:$condition,
+                       Arg<AnyMemRef, "value selected when condition is true">:$true_value,
+                       Arg<AnyMemRef, "value selected when condition is false">:$false_value);
+  let results = (outs AnyMemRef:$result);
+  let hasVerifier = 1;
+
+  let assemblyFormat = [{
+    $condition `,` $true_value `,` $false_value attr-dict
+    `:` type($true_value) `,` type($false_value) `->` type($result)
+  }];
+}
+
+def MemRefExt_LoadExOp : MemRefExt_Op<"load_ex", [
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>
+  ]> {
+  let summary = "Load a bounded external pointer range into a memref tile";
+
+  let description = [{
+    Loads up to `valid_elements` elements from an external pointer-like value
+    into `target`. Elements outside the valid range are filled with `padding`.
+    The pointer operand is intentionally typed as AnyType so the op can carry
+    Triton pointers before they are lowered to memrefs.
+  }];
+
+  let arguments = (ins Arg<AnyType, "external pointer">:$ptr,
+                       I32Attr:$tensor_size,
+                       TT_Int:$valid_size,
+                       TT_Type:$other,
+                       Arg<AnyMemRef, "target memref">:$target,
+                       OptionalAttr<BoolAttr>:$is_other_valid);
+  let hasVerifier = 1;
+
+  let assemblyFormat = [{
+    $ptr `,` $valid_size `,` $other `,` $target attr-dict
+    `:` type($ptr) `,` type($valid_size) `,` type($other) `,` type($target)
+  }];
+}
+
+def MemRefExt_StoreExOp : MemRefExt_Op<"store_ex", [
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>
+  ]> {
+  let summary = "Store a memref tile into a bounded external pointer range";
+
+  let description = [{
+    Stores up to `valid_elements` elements from `source` to an external
+    pointer-like value. The pointer operand is intentionally typed as AnyType so
+    the op can carry Triton pointers before they are lowered to memrefs.
+  }];
+
+  let arguments = (ins Arg<AnyType, "external pointer">:$ptr,
+                       Arg<AnyMemRef, "source memref">:$value,
+                       TT_Int:$valid_size);
+  let hasVerifier = 1;
+
+  let assemblyFormat = [{
+    $ptr `,` $value `,` $valid_size attr-dict
+    `:` type($ptr) `,` type($value) `,` type($valid_size)
+  }];
 }
 
 #endif // HEXAGON_DIALECT_MEMREFEXT_IR_MEMREFEXT_OPS_TD

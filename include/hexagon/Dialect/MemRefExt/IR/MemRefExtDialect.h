@@ -14,6 +14,7 @@
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/OpDefinition.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "triton/Dialect/Triton/IR/Dialect.h"
 
 #include "hexagon/Dialect/MemRefExt/IR/MemRefExtDialect.h.inc"
 

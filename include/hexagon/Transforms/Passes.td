@@ -58,6 +58,20 @@ def ScheduleDoubleBufferCopies :
        "hexagon::createScheduleDoubleBufferCopiesPass()";
 }
 
+def ScheduleDoubleBufferLoadStoreExt :
+    Pass<"schedule-double-buffer-load-store-ext", "func::FuncOp"> {
+  let summary = "Schedule memref_ext.load_ex/store_ex around tile computation";
+  let description = [{
+    Uses local tile data-flow information to move `memref_ext.load_ex`
+    operations as early as legal and `memref_ext.store_ex` operations as late as
+    legal inside double-buffer loops. This is the load/store_ext counterpart of
+    schedule-double-buffer-copies for IR that has not been canonicalized to
+    memref.copy.
+  }];
+  let constructor =
+       "hexagon::createScheduleDoubleBufferLoadStoreExtPass()";
+}
+
 def AnnotateForLoopKind :
     Pass<"annotate-for-loop-kind", "func::FuncOp"> {
   let summary = "Annotate tensor scf.for loops as pointwise or reduce";
@@ -232,6 +246,20 @@ def HexagonDoubleBufferPlanRewrite :
        "hexagon::createHexagonDoubleBufferPlanRewritePass()";
 }
 
+def HexagonDoubleBufferPlanRewriteExt :
+    InterfacePass<"hexagon-double-buffer-plan-rewrite-ext",
+                  "mlir::FunctionOpInterface"> {
+  let summary = "Plan and rewrite memref_ext load/store double-buffer loops";
+
+  let description = [{
+    Builds a local tile-dependence plan for loops that use
+    memref_ext.load_ex/store_ex and rewrites them into the same explicit
+    prologue/kernel ping-pong structure used by the memref.copy plan rewrite.
+  }];
+  let constructor =
+       "hexagon::createHexagonDoubleBufferPlanRewriteExtPass()";
+}
+
 def HexagonDoubleBufferGenericS2 :
     InterfacePass<"hexagon-double-buffer-generic-s2",
                   "mlir::FunctionOpInterface"> {
@@ -264,6 +292,21 @@ def HexagonDoubleBufferDMALowering :
   }];
   let constructor =
        "hexagon::createHexagonDoubleBufferDMALoweringPass()";
+}
+
+def HexagonDoubleBufferDMALoweringExt :
+    InterfacePass<"hexagon-double-buffer-dma-lowering-ext",
+                  "mlir::FunctionOpInterface"> {
+  let summary = "Finalize planned memref_ext load/store double-buffer loops";
+
+  let description = [{
+    Consumes the explicit metadata emitted by
+    hexagon-double-buffer-plan-rewrite-ext. The current implementation keeps
+    memref_ext.load_ex/store_ex as the transfer operations and removes private
+    plan metadata after validating the planned structure.
+  }];
+  let constructor =
+       "hexagon::createHexagonDoubleBufferDMALoweringExtPass()";
 }
 
 def HexagonLowerTmTensor :

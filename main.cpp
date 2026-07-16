@@ -60,6 +60,7 @@
 #include "triton-shared/Dialect/TritonStructured/IR/TritonStructuredDialect.h"
 #include "triton-shared/Dialect/TritonTilingExt/IR/TritonTilingExtDialect.h"
 
+#include "hexagon/Dialect/MemRefExt/IR/MemRefExtDialect.h"
 #include "hexagon/Transforms/Transforms.h"
 #include "hexagon/Conversion/LinalgToLLVM/LinalgToLLVM.h"
 
@@ -80,7 +81,8 @@ static void initContext(mlir::MLIRContext &context) {
               mlir::LLVM::LLVMDialect, mlir::scf::SCFDialect,
               mlir::arith::ArithDialect, mlir::triton::TritonDialect,
               mlir::memref::MemRefDialect, mlir::vector::VectorDialect,
-              mlir::affine::AffineDialect, mlir::cf::ControlFlowDialect>(
+              mlir::affine::AffineDialect, mlir::cf::ControlFlowDialect,
+              mlir::memref_ext::MemRefExtDialect>(
       context);
 }
 
@@ -108,13 +110,30 @@ static void initRegistry(mlir::DialectRegistry &registry) {
   mlir::tensor::registerTilingInterfaceExternalModels(registry);
 }
 
+// 运行示例: ./custom --schedule-double-buffer-load-store-ext-only xxx/db_load_store_ext.mlir
+// db_load_store_ext_out_reuse_load.mlir 与 db_load_store_ext.mlir 必须 --schedule-double-buffer-load-store-ext-only
+// 运行示例: ./custom --schedule-double-buffer-load-store-ext-only xxx/db_fuse_sum_add.mlir
+// db_fuse_sum_add.mlir db_mix_load_compute.mlir db_multi_compute.mlir 不能添加 --schedule-double-buffer-load-store-ext-only
+// 暂时跑这几个测试，其他的后续补充
+// --schedule-double-buffer-load-store-ext-only 的 case 更贴近实际
+// 其他更符合开源 triton-shared
 int main(int argc, char **argv) {
-  if (argc != 2) {
+  if (argc != 2 && argc != 3) {
     llvm::outs() << "run as : " << argv[0] << " xxx.mlir\n";
+    llvm::outs() << "or     : " << argv[0]
+                 << " --schedule-double-buffer-load-store-ext-only xxx.mlir\n";
     return 0;
   }
 
-  auto mlirPath = argv[1];
+  bool runLoadStoreExtOnly = argc == 3 &&
+                             llvm::StringRef(argv[1]) ==
+                                 "--schedule-double-buffer-load-store-ext-only";
+  if (argc == 3 && !runLoadStoreExtOnly) {
+    llvm::outs() << "unknown option: " << argv[1] << "\n";
+    return 0;
+  }
+
+  auto mlirPath = runLoadStoreExtOnly ? argv[2] : argv[1];
 
   mlir::DialectRegistry registry;
   initRegistry(registry);
@@ -128,6 +147,22 @@ int main(int argc, char **argv) {
   }
 
   mlir::PassManager manager(&context);
+  if (runLoadStoreExtOnly) {
+    manager.addNestedPass<mlir::func::FuncOp>(
+        mlir::hexagon::createScheduleDoubleBufferLoadStoreExtPass());
+    manager.addNestedPass<mlir::func::FuncOp>(
+        mlir::hexagon::createHexagonDoubleBufferPlanRewriteExtPass());
+    manager.addNestedPass<mlir::func::FuncOp>(
+        mlir::hexagon::createHexagonDoubleBufferDMALoweringExtPass());
+    if (manager.run(*module).failed()) {
+      llvm::outs() << "run pass failed\n";
+      return -1;
+    }
+
+    module->print(llvm::outs());
+    return 0;
+  }
+
   manager.addPass(mlir::triton::createTritonToLinalgExperimentalPass());
   manager.addPass(mlir::createLinalgFoldUnitExtentDimsPass());
 
@@ -151,23 +186,23 @@ int main(int argc, char **argv) {
         mlir::hexagon::createAnnotateMemrefCopyDirectionPass());
     manager.addNestedPass<mlir::func::FuncOp>(
         mlir::hexagon::createScheduleDoubleBufferCopiesPass());
-    // manager.addNestedPass<mlir::func::FuncOp>(
-    //     mlir::hexagon::createHexagonDoubleBufferPlanRewritePass());
-    // manager.addNestedPass<mlir::func::FuncOp>(mlir::bufferization::createBufferLoopHoistingPass());
-    //
-    // manager.addNestedPass<mlir::func::FuncOp>(mlir::hexagon::createCopyCanonicalizationPass());
-    // manager.addPass(mlir::createCanonicalizerPass());
-    //
-    // mlir::bufferization::buildBufferDeallocationPipeline(
-    //     manager, mlir::bufferization::BufferDeallocationPipelineOptions{});
-    // manager.addPass(mlir::createCSEPass());
-    //
-    // manager.addNestedPass<mlir::func::FuncOp>(
-    //     mlir::hexagon::createHexagonDoubleBufferDMALoweringPass());
-    // manager.addNestedPass<mlir::func::FuncOp>(
-    //     mlir::hexagon::createPlanSharedMemoryPass());
-    // manager.addNestedPass<mlir::func::FuncOp>(mlir::hexagon::createConvertZeroSizeMemrefPass());
-    // manager.addPass(mlir::createConvertBufferizationToMemRefPass());
+    manager.addNestedPass<mlir::func::FuncOp>(
+        mlir::hexagon::createHexagonDoubleBufferPlanRewritePass());
+    manager.addNestedPass<mlir::func::FuncOp>(mlir::bufferization::createBufferLoopHoistingPass());
+
+    manager.addNestedPass<mlir::func::FuncOp>(mlir::hexagon::createCopyCanonicalizationPass());
+    manager.addPass(mlir::createCanonicalizerPass());
+
+    mlir::bufferization::buildBufferDeallocationPipeline(
+        manager, mlir::bufferization::BufferDeallocationPipelineOptions{});
+    manager.addPass(mlir::createCSEPass());
+
+    manager.addNestedPass<mlir::func::FuncOp>(
+        mlir::hexagon::createHexagonDoubleBufferDMALoweringPass());
+    manager.addNestedPass<mlir::func::FuncOp>(
+        mlir::hexagon::createPlanSharedMemoryPass());
+    manager.addNestedPass<mlir::func::FuncOp>(mlir::hexagon::createConvertZeroSizeMemrefPass());
+    manager.addPass(mlir::createConvertBufferizationToMemRefPass());
   }
 
   manager.addPass(mlir::createCanonicalizerPass());
