@@ -88,6 +88,20 @@ LogicalResult DmaStartExOp::verify() {
   return success();
 }
 
+void DmaBlockDescriptorLoadOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  effects.emplace_back(MemoryEffects::Read::get(), &getDescMutable(),
+                       SideEffects::DefaultResource::get());
+  effects.emplace_back(MemoryEffects::Write::get(), &getTargetMutable(),
+                       SideEffects::DefaultResource::get());
+  effects.emplace_back(MemoryEffects::Read::get(), &getHandleMutable(),
+                       DmaHandleResource::get());
+  effects.emplace_back(MemoryEffects::Write::get(), &getHandleMutable(),
+                       DmaHandleResource::get());
+  effects.emplace_back(MemoryEffects::Write::get(), DmaSyncResource::get());
+}
+
 void DmaWaitOp::getEffects(
     SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
         &effects) {
@@ -133,4 +147,40 @@ LogicalResult StoreExOp::verify() {
   if (!isa<triton::PointerType>(getPtr().getType()))
     return emitOpError("expects ptr to have !tt.ptr type");
   return success();
+}
+
+void BlockDescriptorLoadOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  effects.emplace_back(MemoryEffects::Read::get(), &getDescMutable(),
+                       SideEffects::DefaultResource::get());
+  effects.emplace_back(MemoryEffects::Write::get(), &getTargetMutable(),
+                       SideEffects::DefaultResource::get());
+}
+
+void BlockDescriptorStoreOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  effects.emplace_back(MemoryEffects::Write::get(), &getDescMutable(),
+                       SideEffects::DefaultResource::get());
+  effects.emplace_back(MemoryEffects::Read::get(), &getValueMutable(),
+                       SideEffects::DefaultResource::get());
+}
+
+void BlockDescLoadOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  effects.emplace_back(MemoryEffects::Read::get(), &getDescMutable(),
+                       SideEffects::DefaultResource::get());
+  effects.emplace_back(MemoryEffects::Write::get(), &getTargetMutable(),
+                       SideEffects::DefaultResource::get());
+}
+
+void BlockDescStoreOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  effects.emplace_back(MemoryEffects::Write::get(), &getDescMutable(),
+                       SideEffects::DefaultResource::get());
+  effects.emplace_back(MemoryEffects::Read::get(), &getValueMutable(),
+                       SideEffects::DefaultResource::get());
 }

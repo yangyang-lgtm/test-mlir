@@ -261,7 +261,7 @@ flowchart LR
 ```
 
 注意：这里的 IR 顺序是 prefetch 在 compute 前。后续 DMA lowering 会把它变成
-`dma_start_ex`，再在 prefetch 后插入等待当前轮 load handle 的 `dma_wait`，从而形成
+`dma_load_ex`，再在 prefetch 后插入等待当前轮 load handle 的 `dma_wait`，从而形成
 “下一轮 DMA 与当前轮 compute 重叠”的结构。
 
 ## 阶段 8：克隆 compute 和 store

@@ -3,12 +3,12 @@
 `HexagonDoubleBufferDMALoweringExtPass` 消费
 `HexagonDoubleBufferPlanRewriteExtPass` 生成的显式 double-buffer 结构和
 `db_plan_*` 属性，把计划中的 `memref_ext.load_ex` 预取 lowered 成
-`memref_ext.dma_start_ex`，并在 kernel loop 中插入对应的 `dma_wait`。
+`memref_ext.dma_load_ex`，并在 kernel loop 中插入对应的 `dma_wait`。
 
 当前实现的重点是输入预取 DMA 化：
 
-- prologue 中的 `load_ex[prefetch]` -> `dma_start_ex`，使用 ping handle。
-- loop 内 prefetch 中的 `load_ex[prefetch]` -> `dma_start_ex`，使用 next handle。
+- prologue 中的 `load_ex[prefetch]` -> `dma_load_ex`，使用 ping handle。
+- loop 内 prefetch 中的 `load_ex[prefetch]` -> `dma_load_ex`，使用 next handle。
 - prefetch 后插入 `dma_wait(currentLoadHandle)`，保证当前轮 compute 使用的数据已经到达。
 - `store_ex[db2store]` 参与 planned schedule 校验，但当前代码不会把 store lowered 成 DMA。
 - lowering 完成后删除所有私有 `db_plan_*` 属性。
@@ -43,9 +43,9 @@ flowchart TD
   C -- no --> Skip[跳过该 kernel]
   C -- yes --> D[lowerSchedule]
   D --> E[在 prologue 前创建 ping/pong load handle]
-  E --> F[prologue load_ex -> dma_start_ex ping handle]
+  E --> F[prologue load_ex -> dma_load_ex ping handle]
   F --> G[根据 kernel i1 状态选择 current/next handle]
-  G --> H[prefetch load_ex -> dma_start_ex next handle]
+  G --> H[prefetch load_ex -> dma_load_ex next handle]
   H --> I[prefetch 后插入 dma_wait current handle]
   I --> J[cleanPlanAttrs 清理 db_plan_* 属性]
 ```
@@ -137,7 +137,7 @@ scf.if %has_first {
   %num = arith.index_cast %valid : i32 to index
   %positive = arith.cmpi sgt, %num, %c0 : index
   scf.if %positive {
-    memref_ext.dma_start_ex %ptr0, %valid, %other, %ping, %ping_h
+    memref_ext.dma_load_ex %ptr0, %valid, %other, %ping, %ping_h
         {tensor_size = 128 : i32, is_other_valid = false}
         : ...
   }
@@ -153,7 +153,7 @@ scf.if %has_first {
 flowchart TD
   L["load_ex(ptr, valid, other, target)"] --> C["cast valid to index"]
   C --> P{"valid > 0?"}
-  P -- yes --> D["dma_start_ex(ptr, valid, other, target, handle)"]
+  P -- yes --> D["dma_load_ex(ptr, valid, other, target, handle)"]
   P -- no --> N["不发起 DMA"]
   D --> E["erase load_ex"]
 ```
@@ -193,7 +193,7 @@ prefetch then block 中的 `load_ex[prefetch]` 会被替换成：
 ```mlir
 scf.if %has_next {
   scf.if %valid_positive {
-    memref_ext.dma_start_ex ..., %nextLoadHandle
+    memref_ext.dma_load_ex ..., %nextLoadHandle
   }
 }
 ```
@@ -217,7 +217,7 @@ Before lowering:
 
 After lowering:
   if has_next:
-    dma_start_ex next buffer using nextLoadHandle
+    dma_load_ex next buffer using nextLoadHandle
   dma_wait currentLoadHandle
   compute current buffer
   store current buffer
@@ -282,7 +282,7 @@ for iv iter_args(cur):
 
 if has_first:
   if first_valid > 0:
-    dma_start_ex first -> ping, %ping_h
+    dma_load_ex first -> ping, %ping_h
 
 for iv iter_args(cur):
   %current_h = select cur, %ping_h, %pong_h
@@ -290,7 +290,7 @@ for iv iter_args(cur):
 
   if has_next:
     if next_valid > 0:
-      dma_start_ex next -> next buffer, %next_h
+      dma_load_ex next -> next buffer, %next_h
 
   dma_wait %current_h
 
@@ -312,7 +312,7 @@ for iv iter_args(cur):
 
 `lowerSchedule()` 返回 failure 并触发 pass failure：
 
-- `replaceLoadWithDMAStart()` 创建正数 guard 或 `dma_start_ex` 失败。
+- `replaceLoadWithDMAStart()` 创建正数 guard 或 `dma_load_ex` 失败。
 
 ## 与 PlanRewriteExt 的配合
 
@@ -328,7 +328,7 @@ db_plan_copy_role = prefetch/db2store
 `HexagonDoubleBufferDMALoweringExtPass` 负责消费这些属性：
 
 ```text
-prefetch load_ex -> dma_start_ex
+prefetch load_ex -> dma_load_ex
 insert dma_wait for current handle
 remove db_plan_* attrs
 ```

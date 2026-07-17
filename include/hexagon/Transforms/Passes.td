@@ -59,7 +59,7 @@ def ScheduleDoubleBufferCopies :
 }
 
 def ScheduleDoubleBufferLoadStoreExt :
-    Pass<"schedule-double-buffer-load-store-ext", "func::FuncOp"> {
+    InterfacePass<"schedule-double-buffer-load-store-ext", "mlir::FunctionOpInterface"> {
   let summary = "Schedule memref_ext.load_ex/store_ex around tile computation";
   let description = [{
     Uses local tile data-flow information to move `memref_ext.load_ex`

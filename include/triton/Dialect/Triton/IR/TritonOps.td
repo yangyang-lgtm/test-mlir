@@ -1074,6 +1074,24 @@ def TT_MakeTensorDescOp : TT_Op<"make_tensor_descriptor", [
   }];
 }
 
+def TT_MakeBlockDescOp : TT_Op<"make_block_desc", [Pure]> {
+  let summary = "Legacy make block descriptor op";
+
+  let arguments = (ins
+    TT_Ptr:$base,
+    I64:$shape0,
+    I64:$shape1,
+    I64:$stride0,
+    I64:$stride1,
+    I32:$offset0,
+    I32:$offset1,
+    DenseI64ArrayAttr:$tensorShape,
+    DenseI32ArrayAttr:$order
+  );
+
+  let results = (outs TT_BlockDescType:$result);
+}
+
 // The following ops, including `call`, `func`, and `return` are copied and modified from
 // https://github.com/llvm/llvm-project/blob/main/mlir/include/mlir/Dialect/Func/IR/FuncOps.td
 // We could revert it back once MLIR has a better inliner interface.

@@ -131,4 +131,37 @@ def TT_TensorDescType : TritonTypeDef<"TensorDesc", "tensordesc", [TT_TensorDesc
   ];
 }
 
+def TT_BlockDescType : TritonTypeDef<"BlockDesc", "block_desc", [TT_TensorDescInterface]> {
+  let summary = "Legacy Triton block descriptor type";
+
+  let description = [{
+    Compatibility type for older textual IR that used `!tt.block_desc`.
+    Newer IR should prefer `!tt.tensordesc<tensor<...>>`.
+  }];
+
+  let parameters = (ins
+    "Type":$elementType,
+    ArrayRefParameter<"int64_t">:$shape,
+    ArrayRefParameter<"int64_t">:$order
+  );
+
+  let builders = [
+    TypeBuilderWithInferredContext<(ins
+      "Type":$elementType,
+      "llvm::ArrayRef<int64_t>":$shape,
+      "llvm::ArrayRef<int64_t>":$order
+    ), [{
+      return $_get(elementType.getContext(), elementType, shape, order);
+    }]>
+  ];
+
+  let extraClassDeclaration = [{
+    RankedTensorType getBlockType() const {
+      return RankedTensorType::get(getShape(), getElementType());
+    }
+  }];
+
+  let hasCustomAssemblyFormat = 1;
+}
+
 #endif

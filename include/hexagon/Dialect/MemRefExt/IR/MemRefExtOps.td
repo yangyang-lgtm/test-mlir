@@ -93,7 +93,7 @@ def MemRefExt_Dma2DStartOp : MemRefExt_Op<"dma_2d_start", [
   }];
 }
 
-def MemRefExt_DmaStartExOp : MemRefExt_Op<"dma_start_ex", [
+def MemRefExt_DmaStartExOp : MemRefExt_Op<"dma_load_ex", [
     DeclareOpInterfaceMethods<MemoryEffectsOpInterface>
   ]> {
   let summary = "Start an asynchronous bounded external load";
@@ -118,6 +118,31 @@ def MemRefExt_DmaStartExOp : MemRefExt_Op<"dma_start_ex", [
     $ptr `,` $valid_size `,` $other `,` $target `,` $handle attr-dict
     `:` type($ptr) `,` type($valid_size) `,` type($other) `,`
     type($target) `,` type($handle)
+  }];
+}
+
+def MemRefExt_DmaBlockDescriptorLoadOp
+    : MemRefExt_Op<"dma_block_descriptor_load", [
+        DeclareOpInterfaceMethods<MemoryEffectsOpInterface>
+      ]> {
+  let summary = "Start an asynchronous descriptor block load";
+
+  let description = [{
+    Asynchronously loads a block described by a Triton tensor descriptor into a
+    local memref tile. The explicit DMA handle groups the transfer for a later
+    `memref_ext.dma_wait`.
+  }];
+
+  let arguments = (ins Arg<TT_AnyTensorDescType, "tensor descriptor">:$desc,
+                       DefaultValuedAttr<DenseI32ArrayAttr,
+                           "::llvm::ArrayRef<int32_t>{}">:$boundaryCheck,
+                       OptionalAttr<AnyAttr>:$padding,
+                       Arg<AnyMemRef, "target memref">:$target,
+                       Arg<MemRefExt_DmaHandle, "DMA handle">:$handle);
+
+  let assemblyFormat = [{
+    $desc `,` $target `,` $handle attr-dict
+    `:` qualified(type($desc)) `,` type($target) `,` type($handle)
   }];
 }
 
@@ -200,6 +225,79 @@ def MemRefExt_StoreExOp : MemRefExt_Op<"store_ex", [
   let assemblyFormat = [{
     $ptr `,` $value `,` $valid_size attr-dict
     `:` type($ptr) `,` type($value) `,` type($valid_size)
+  }];
+}
+
+def MemRefExt_BlockDescriptorLoadOp : MemRefExt_Op<"block_descriptor_load", [
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>
+  ]> {
+  let summary = "Load a 2D descriptor block into a memref tile";
+
+  let description = [{
+    Loads a block described by a Triton block descriptor into a local memref
+    tile. The target memref shape is expected to match the descriptor block.
+  }];
+
+  let arguments = (ins Arg<TT_AnyTensorDescType, "tensor descriptor">:$desc,
+                       DefaultValuedAttr<DenseI32ArrayAttr,
+                           "::llvm::ArrayRef<int32_t>{}">:$boundaryCheck,
+                       OptionalAttr<AnyAttr>:$padding,
+                       Arg<AnyMemRef, "target memref">:$target);
+
+  let assemblyFormat = [{
+    $desc `,` $target attr-dict `:` qualified(type($desc)) `,` type($target)
+  }];
+}
+
+def MemRefExt_BlockDescriptorStoreOp : MemRefExt_Op<"block_descriptor_store", [
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>
+  ]> {
+  let summary = "Store a memref tile through a 2D descriptor block";
+
+  let description = [{
+    Stores a local memref tile into the block described by a Triton block
+    descriptor. The source memref shape is expected to match the descriptor
+    block.
+  }];
+
+  let arguments = (ins Arg<TT_AnyTensorDescType, "tensor descriptor">:$desc,
+                       Arg<AnyMemRef, "source memref">:$value,
+                       DefaultValuedAttr<DenseI32ArrayAttr,
+                           "::llvm::ArrayRef<int32_t>{}">:$boundaryCheck);
+
+  let assemblyFormat = [{
+    $desc `,` $value attr-dict `:` qualified(type($desc)) `,` type($value)
+  }];
+}
+
+def MemRefExt_BlockDescLoadOp : MemRefExt_Op<"block_desc_load", [
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>
+  ]> {
+  let summary = "Load a legacy Triton block descriptor into a memref tile";
+
+  let arguments = (ins Arg<TT_BlockDescType, "legacy block descriptor">:$desc,
+                       DefaultValuedAttr<DenseI32ArrayAttr,
+                           "::llvm::ArrayRef<int32_t>{}">:$boundaryCheck,
+                       OptionalAttr<AnyAttr>:$padding,
+                       Arg<AnyMemRef, "target memref">:$target);
+
+  let assemblyFormat = [{
+    $desc `,` $target attr-dict `:` qualified(type($desc)) `,` type($target)
+  }];
+}
+
+def MemRefExt_BlockDescStoreOp : MemRefExt_Op<"block_desc_store", [
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>
+  ]> {
+  let summary = "Store a memref tile through a legacy Triton block descriptor";
+
+  let arguments = (ins Arg<TT_BlockDescType, "legacy block descriptor">:$desc,
+                       Arg<AnyMemRef, "source memref">:$value,
+                       DefaultValuedAttr<DenseI32ArrayAttr,
+                           "::llvm::ArrayRef<int32_t>{}">:$boundaryCheck);
+
+  let assemblyFormat = [{
+    $desc `,` $value attr-dict `:` qualified(type($desc)) `,` type($value)
   }];
 }
 

@@ -27,7 +27,7 @@ createAnnotateMemrefCopyDirectionPass();
 std::unique_ptr<OperationPass<func::FuncOp>>
 createScheduleDoubleBufferCopiesPass();
 
-std::unique_ptr<OperationPass<func::FuncOp>>
+std::unique_ptr<InterfacePass<FunctionOpInterface>>
 createScheduleDoubleBufferLoadStoreExtPass();
 
 std::unique_ptr<OperationPass<func::FuncOp>> createAnnotateForLoopKindPass();

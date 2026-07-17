@@ -52,6 +52,45 @@ void PointerType::print(AsmPrinter &printer) const {
   }
 }
 
+Type BlockDescType::parse(AsmParser &parser) {
+  if (parser.parseLess())
+    return Type();
+
+  Type elementType;
+  if (parser.parseType(elementType))
+    return Type();
+
+  SmallVector<int64_t> shape;
+  SmallVector<int64_t> order;
+  auto parseInteger = [&]() -> FailureOr<int64_t> {
+    int64_t value;
+    if (parser.parseComma() || parser.parseInteger(value))
+      return failure();
+    return value;
+  };
+
+  FailureOr<int64_t> dim0 = parseInteger();
+  FailureOr<int64_t> dim1 = parseInteger();
+  FailureOr<int64_t> order0 = parseInteger();
+  FailureOr<int64_t> order1 = parseInteger();
+  if (failed(dim0) || failed(dim1) || failed(order0) || failed(order1) ||
+      parser.parseGreater())
+    return Type();
+
+  shape.assign({*dim0, *dim1});
+  order.assign({*order0, *order1});
+  return BlockDescType::get(elementType, shape, order);
+}
+
+void BlockDescType::print(AsmPrinter &printer) const {
+  printer << "<" << getElementType();
+  for (int64_t dim : getShape())
+    printer << ", " << dim;
+  for (int64_t dim : getOrder())
+    printer << ", " << dim;
+  printer << ">";
+}
+
 namespace mlir {
 
 namespace triton {
