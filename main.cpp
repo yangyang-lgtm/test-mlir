@@ -154,11 +154,16 @@ int main(int argc, char **argv) {
         mlir::hexagon::createHexagonDoubleBufferPlanRewriteExtPass());
     manager.addNestedPass<mlir::func::FuncOp>(
         mlir::hexagon::createHexagonDoubleBufferDMALoweringExtPass());
+
+    // manager.addPass(mlir::createCanonicalizerPass());
+    // manager.addPass(mlir::createCSEPass());
+    // manager.addPass(mlir::createLoopInvariantCodeMotionPass());
+    // manager.addPass(mlir::createSymbolDCEPass());
+
     if (manager.run(*module).failed()) {
       llvm::outs() << "run pass failed\n";
       return -1;
     }
-
     module->print(llvm::outs());
     return 0;
   }

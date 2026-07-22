@@ -11,8 +11,8 @@ using namespace mlir;
 using namespace mlir::memref_ext;
 
 void MemRefExtDialect::initialize() {
-  registerTypes();
   registerOperations();
+  registerTypes();
 }
 
 #include "hexagon/Dialect/MemRefExt/IR/MemRefExtDialect.cpp.inc"

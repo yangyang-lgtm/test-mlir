@@ -75,7 +75,8 @@ Value createNumElements(Location loc, IRRewriter &rewriter, Value view) {
 }
 
 bool createDMAStartOp(Location loc, IRRewriter &rewriter, Value source,
-                      Value target, Value tagAlloc, Operation **createdOp) {
+                      Value target, Value tagAlloc, Value fetchData,
+                      Operation **createdOp) {
   auto sourceType = source.getType();
   auto targetType = target.getType();
 
@@ -105,7 +106,7 @@ bool createDMAStartOp(Location loc, IRRewriter &rewriter, Value source,
   if (rank == 1 || (isContiguousMemrefType(sourceMemRefType) &&
                     isContiguousMemrefType(targetMemRefType))) {
     OperationState state(loc, "memref_ext.dma_start");
-    state.addOperands({source, target, numElements, tagAlloc});
+    state.addOperands({source, target, numElements, tagAlloc, fetchData});
     Operation *dmaStart = rewriter.create(state);
     if (createdOp)
       *createdOp = dmaStart;
@@ -131,8 +132,8 @@ bool createDMAStartOp(Location loc, IRRewriter &rewriter, Value source,
                                   : width;
   Value dstStride = targetStrided ? getI32Const(loc, rewriter, targetStride)
                                   : width;
-  state.addOperands(
-      {source, target, numElements, tagAlloc, srcStride, dstStride, width});
+  state.addOperands({source, target, numElements, tagAlloc, fetchData,
+                     srcStride, dstStride, width});
   Operation *dmaStart = rewriter.create(state);
   if (createdOp)
     *createdOp = dmaStart;

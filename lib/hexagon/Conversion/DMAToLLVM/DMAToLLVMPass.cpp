@@ -114,11 +114,71 @@ struct LowerDMAHandle : public ConvertToLLVMPattern {
                   ConversionPatternRewriter &rewriter) const override;
 };
 
+struct LowerCreateAndInitHandles : public ConvertToLLVMPattern {
+  LowerCreateAndInitHandles(MLIRContext *context,
+                            const LLVMTypeConverter &typeConverter,
+                            PatternBenefit benefit = 1)
+      : ConvertToLLVMPattern("memref_ext.create_and_init_handles", context,
+                             typeConverter, benefit) {}
+
+  LogicalResult
+  matchAndRewrite(Operation *op, ArrayRef<Value> operands,
+                  ConversionPatternRewriter &rewriter) const override;
+};
+
+struct LowerDMAFetchData : public ConvertToLLVMPattern {
+  LowerDMAFetchData(MLIRContext *context,
+                    const LLVMTypeConverter &typeConverter,
+                    PatternBenefit benefit = 1)
+      : ConvertToLLVMPattern("memref_ext.dma_fetch_data", context,
+                             typeConverter, benefit) {}
+
+  LogicalResult
+  matchAndRewrite(Operation *op, ArrayRef<Value> operands,
+                  ConversionPatternRewriter &rewriter) const override;
+};
+
+struct LowerCreateDoubleBufferFetchData : public ConvertToLLVMPattern {
+  LowerCreateDoubleBufferFetchData(MLIRContext *context,
+                                   const LLVMTypeConverter &typeConverter,
+                                   PatternBenefit benefit = 1)
+      : ConvertToLLVMPattern("memref_ext.create_fetch_data", context,
+                             typeConverter, benefit) {}
+
+  LogicalResult
+  matchAndRewrite(Operation *op, ArrayRef<Value> operands,
+                  ConversionPatternRewriter &rewriter) const override;
+};
+
 struct LowerDMAExtWait : public ConvertToLLVMPattern {
   LowerDMAExtWait(MLIRContext *context, const LLVMTypeConverter &typeConverter,
                   PatternBenefit benefit = 1)
       : ConvertToLLVMPattern("memref_ext.dma_wait", context, typeConverter,
                              benefit) {}
+
+  LogicalResult
+  matchAndRewrite(Operation *op, ArrayRef<Value> operands,
+                  ConversionPatternRewriter &rewriter) const override;
+};
+
+struct LowerSelectDMAHandle : public ConvertToLLVMPattern {
+  LowerSelectDMAHandle(MLIRContext *context,
+                       const LLVMTypeConverter &typeConverter,
+                       PatternBenefit benefit = 1)
+      : ConvertToLLVMPattern("memref_ext.select_dma_handle", context,
+                             typeConverter, benefit) {}
+
+  LogicalResult
+  matchAndRewrite(Operation *op, ArrayRef<Value> operands,
+                  ConversionPatternRewriter &rewriter) const override;
+};
+
+struct LowerSelectDMAFetchData : public ConvertToLLVMPattern {
+  LowerSelectDMAFetchData(MLIRContext *context,
+                          const LLVMTypeConverter &typeConverter,
+                          PatternBenefit benefit = 1)
+      : ConvertToLLVMPattern("memref_ext.select_dma_fetch_data", context,
+                             typeConverter, benefit) {}
 
   LogicalResult
   matchAndRewrite(Operation *op, ArrayRef<Value> operands,
@@ -331,7 +391,7 @@ LogicalResult LowerDMAExtStart::matchAndRewrite(
   MLIRContext *context = op->getContext();
   Location loc = op->getLoc();
   ModuleOp module = op->getParentOfType<ModuleOp>();
-  if (op->getNumOperands() != 4 || operands.size() != 4)
+  if (op->getNumOperands() != 5 || operands.size() != 5)
     return failure();
 
   FailureOr<LLVM::LLVMFuncOp> funcOp =
@@ -395,7 +455,7 @@ LogicalResult LowerDMA2DStart::matchAndRewrite(
   MLIRContext *context = op->getContext();
   Location loc = op->getLoc();
   ModuleOp module = op->getParentOfType<ModuleOp>();
-  if (op->getNumOperands() != 7 || operands.size() != 7)
+  if (op->getNumOperands() != 8 || operands.size() != 8)
     return failure();
 
   FailureOr<LLVM::LLVMFuncOp> funcOp = getDMA2DStartFn(
@@ -432,15 +492,15 @@ LogicalResult LowerDMA2DStart::matchAndRewrite(
               .getElementType()
               .getIntOrFloatBitWidth() /
           8);
-  Value width = convertToI32Type(loc, operands[6], rewriter, context);
+  Value width = convertToI32Type(loc, operands[7], rewriter, context);
   Value widthInBytes =
       LLVM::MulOp::create(rewriter, loc, width, typeSizeInBytes);
   Value height = LLVM::SDivOp::create(
       rewriter, loc,
       LLVM::MulOp::create(rewriter, loc, numElements, typeSizeInBytes),
       widthInBytes);
-  Value srcStride = convertToI32Type(loc, operands[4], rewriter, context);
-  Value dstStride = convertToI32Type(loc, operands[5], rewriter, context);
+  Value srcStride = convertToI32Type(loc, operands[5], rewriter, context);
+  Value dstStride = convertToI32Type(loc, operands[6], rewriter, context);
   Value srcStrideInBytes =
       LLVM::MulOp::create(rewriter, loc, srcStride, typeSizeInBytes);
   Value dstStrideInBytes =
@@ -482,6 +542,73 @@ LogicalResult LowerDMAHandle::matchAndRewrite(
   return success();
 }
 
+LogicalResult LowerCreateAndInitHandles::matchAndRewrite(
+    Operation *op, ArrayRef<Value> operands,
+    ConversionPatternRewriter &rewriter) const {
+  auto handlesType =
+      cast<memref_ext::DoubleBufferDmaHandlesType>(op->getResult(0).getType());
+  if (handlesType.getNumHandles() != 2)
+    return failure();
+  Location loc = op->getLoc();
+  MLIRContext *context = op->getContext();
+  Type ptrType = getPtrTy(context);
+  auto one = LLVM::ConstantOp::create(rewriter, loc, getIndexType(),
+                                      rewriter.getIndexAttr(1));
+  Value ping = LLVM::AllocaOp::create(rewriter, loc, ptrType,
+                                      rewriter.getI32Type(), one);
+  Value pong = LLVM::AllocaOp::create(rewriter, loc, ptrType,
+                                      rewriter.getI32Type(), one);
+  auto llvmHandlesType =
+      LLVM::LLVMStructType::getLiteral(context, {ptrType, ptrType});
+  Value handles = LLVM::UndefOp::create(rewriter, loc, llvmHandlesType);
+  handles = LLVM::InsertValueOp::create(rewriter, loc, handles, ping,
+                                        ArrayRef<int64_t>{0});
+  handles = LLVM::InsertValueOp::create(rewriter, loc, handles, pong,
+                                        ArrayRef<int64_t>{1});
+  rewriter.replaceOp(op, handles);
+  return success();
+}
+
+LogicalResult LowerDMAFetchData::matchAndRewrite(
+    Operation *op, ArrayRef<Value> operands,
+    ConversionPatternRewriter &rewriter) const {
+  Location loc = op->getLoc();
+  MLIRContext *context = op->getContext();
+  auto one = LLVM::ConstantOp::create(rewriter, loc, getIndexType(),
+                                      rewriter.getIndexAttr(1));
+  auto fetchData = LLVM::AllocaOp::create(rewriter, loc, getPtrTy(context),
+                                          rewriter.getI32Type(), one);
+  rewriter.replaceOp(op, fetchData.getResult());
+  return success();
+}
+
+LogicalResult LowerCreateDoubleBufferFetchData::matchAndRewrite(
+    Operation *op, ArrayRef<Value> operands,
+    ConversionPatternRewriter &rewriter) const {
+  auto fetchDataType = cast<memref_ext::DoubleBufferDmaFetchDataType>(
+      op->getResult(0).getType());
+  if (fetchDataType.getNumFetchData() != 2)
+    return failure();
+  Location loc = op->getLoc();
+  MLIRContext *context = op->getContext();
+  Type ptrType = getPtrTy(context);
+  auto one = LLVM::ConstantOp::create(rewriter, loc, getIndexType(),
+                                      rewriter.getIndexAttr(1));
+  Value ping = LLVM::AllocaOp::create(rewriter, loc, ptrType,
+                                      rewriter.getI32Type(), one);
+  Value pong = LLVM::AllocaOp::create(rewriter, loc, ptrType,
+                                      rewriter.getI32Type(), one);
+  auto llvmFetchDataType =
+      LLVM::LLVMStructType::getLiteral(context, {ptrType, ptrType});
+  Value fetchData = LLVM::UndefOp::create(rewriter, loc, llvmFetchDataType);
+  fetchData = LLVM::InsertValueOp::create(rewriter, loc, fetchData, ping,
+                                          ArrayRef<int64_t>{0});
+  fetchData = LLVM::InsertValueOp::create(rewriter, loc, fetchData, pong,
+                                          ArrayRef<int64_t>{1});
+  rewriter.replaceOp(op, fetchData);
+  return success();
+}
+
 LogicalResult LowerDMAExtWait::matchAndRewrite(
     Operation *op, ArrayRef<Value> operands,
     ConversionPatternRewriter &rewriter) const {
@@ -499,6 +626,40 @@ LogicalResult LowerDMAExtWait::matchAndRewrite(
       LLVM::LoadOp::create(rewriter, loc, rewriter.getI32Type(), operands[0]);
   rewriter.eraseOp(op);
   LLVM::CallOp::create(rewriter, loc, funcOp.value(), ValueRange{token});
+  return success();
+}
+
+LogicalResult LowerSelectDMAHandle::matchAndRewrite(
+    Operation *op, ArrayRef<Value> operands,
+    ConversionPatternRewriter &rewriter) const {
+  if (op->getNumOperands() != 2 || operands.size() != 2)
+    return failure();
+  Location loc = op->getLoc();
+  Type ptrType = getPtrTy(op->getContext());
+  Value ping = LLVM::ExtractValueOp::create(rewriter, loc, ptrType, operands[1],
+                                            ArrayRef<int64_t>{0});
+  Value pong = LLVM::ExtractValueOp::create(rewriter, loc, ptrType, operands[1],
+                                            ArrayRef<int64_t>{1});
+  auto selected = LLVM::SelectOp::create(rewriter, loc, ptrType, operands[0],
+                                         ping, pong);
+  rewriter.replaceOp(op, selected.getResult());
+  return success();
+}
+
+LogicalResult LowerSelectDMAFetchData::matchAndRewrite(
+    Operation *op, ArrayRef<Value> operands,
+    ConversionPatternRewriter &rewriter) const {
+  if (op->getNumOperands() != 2 || operands.size() != 2)
+    return failure();
+  Location loc = op->getLoc();
+  Type ptrType = getPtrTy(op->getContext());
+  Value ping = LLVM::ExtractValueOp::create(rewriter, loc, ptrType, operands[1],
+                                            ArrayRef<int64_t>{0});
+  Value pong = LLVM::ExtractValueOp::create(rewriter, loc, ptrType, operands[1],
+                                            ArrayRef<int64_t>{1});
+  auto selected = LLVM::SelectOp::create(rewriter, loc, ptrType, operands[0],
+                                         ping, pong);
+  rewriter.replaceOp(op, selected.getResult());
   return success();
 }
 
@@ -575,8 +736,11 @@ LowerDMAWait::matchAndRewrite(memref::DmaWaitOp op, OpAdaptor adaptor,
 void populateDMAToLLVMConversionPatterns(LLVMTypeConverter &converter,
                                          RewritePatternSet &patterns) {
   patterns.add<LowerDMAStart, LowerDMAWait>(converter);
-  patterns.add<LowerDMAHandle, LowerDMAExtStart, LowerDMA2DStart,
-               LowerDMAExtWait>(patterns.getContext(), converter);
+  patterns.add<LowerDMAHandle, LowerCreateAndInitHandles,
+               LowerDMAFetchData, LowerCreateDoubleBufferFetchData,
+               LowerDMAExtStart, LowerDMA2DStart, LowerDMAExtWait,
+               LowerSelectDMAHandle, LowerSelectDMAFetchData>(
+      patterns.getContext(), converter);
 }
 
 struct DMAToLLVMPass : public ::impl::DMAToLLVMBase<DMAToLLVMPass> {
@@ -600,6 +764,23 @@ struct DMAToLLVMPass : public ::impl::DMAToLLVMBase<DMAToLLVMPass> {
     typeConverter.addConversion([context](memref_ext::DmaHandleType type) {
       return LLVM::LLVMPointerType::get(context);
     });
+    typeConverter.addConversion(
+        [context](memref_ext::DoubleBufferDmaHandlesType type) -> Type {
+          if (type.getNumHandles() != 2)
+            return Type();
+          Type ptrType = LLVM::LLVMPointerType::get(context);
+          return LLVM::LLVMStructType::getLiteral(context, {ptrType, ptrType});
+        });
+    typeConverter.addConversion([context](memref_ext::DmaFetchDataType type) {
+      return LLVM::LLVMPointerType::get(context);
+    });
+    typeConverter.addConversion(
+        [context](memref_ext::DoubleBufferDmaFetchDataType type) -> Type {
+          if (type.getNumFetchData() != 2)
+            return Type();
+          Type ptrType = LLVM::LLVMPointerType::get(context);
+          return LLVM::LLVMStructType::getLiteral(context, {ptrType, ptrType});
+        });
     populateDMAToLLVMConversionPatterns(typeConverter, patterns);
 
     if (failed(applyPartialConversion(moduleOp, target, std::move(patterns))))

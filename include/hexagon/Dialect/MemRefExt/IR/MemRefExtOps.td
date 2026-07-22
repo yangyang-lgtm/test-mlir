@@ -33,6 +33,53 @@ def MemRefExt_DmaHandleOp : MemRefExt_Op<"dma_handle"> {
   let assemblyFormat = "attr-dict `:` type($handle)";
 }
 
+def MemRefExt_CreateAndInitHandlesOp
+    : MemRefExt_Op<"create_and_init_handles"> {
+  let summary = "Create ping/pong DMA handles";
+
+  let description = [{
+    Creates a pair of DMA handles for a double-buffered transfer stream.
+    `select_dma_handle` selects the ping handle when its condition is true and
+    the pong handle otherwise.
+  }];
+
+  let results = (outs MemRefExt_DoubleBufferDmaHandles:$handles);
+  let hasVerifier = 1;
+
+  let assemblyFormat = "attr-dict `:` qualified(type($handles))";
+}
+
+def MemRefExt_DmaFetchDataOp : MemRefExt_Op<"dma_fetch_data"> {
+  let summary = "Create DMA fetch data storage";
+
+  let description = [{
+    Creates a DMA fetch data SSA value. DMA start operations may read and write
+    this value while a transfer is in flight. Double-buffered schedules must
+    use independent fetch data values for ping/pong transfers so a value is not
+    reused while the associated asynchronous transfer may still be active.
+  }];
+
+  let results = (outs MemRefExt_DmaFetchData:$fetch_data);
+
+  let assemblyFormat = "attr-dict `:` type($fetch_data)";
+}
+
+def MemRefExt_CreateDoubleBufferFetchDataOp
+    : MemRefExt_Op<"create_fetch_data"> {
+  let summary = "Create ping/pong DMA fetch data";
+
+  let description = [{
+    Creates a pair of DMA fetch data values for a double-buffered transfer
+    stream. `select_dma_fetch_data` selects the ping fetch data when its
+    condition is true and the pong fetch data otherwise.
+  }];
+
+  let results = (outs MemRefExt_DoubleBufferDmaFetchData:$fetch_data);
+  let hasVerifier = 1;
+
+  let assemblyFormat = "attr-dict `:` qualified(type($fetch_data))";
+}
+
 def MemRefExt_DmaStartOp : MemRefExt_Op<"dma_start", [
     DeclareOpInterfaceMethods<MemoryEffectsOpInterface>
   ]> {
@@ -53,12 +100,15 @@ def MemRefExt_DmaStartOp : MemRefExt_Op<"dma_start", [
   let arguments = (ins Arg<AnyType, "source memory object">:$source,
                        Arg<AnyType, "target memory object">:$target,
                        Index:$num_elements,
-                       Arg<MemRefExt_DmaHandle, "DMA handle">:$handle);
+                       Arg<MemRefExt_DmaHandle, "DMA handle">:$handle,
+                       Arg<MemRefExt_DmaFetchData,
+                           "DMA fetch data">:$fetch_data);
   let hasVerifier = 1;
 
   let assemblyFormat = [{
-    $source `,` $target `,` $num_elements `,` $handle attr-dict
-    `:` type($source) `to` type($target) `,` type($handle)
+    $source `,` $target `,` $num_elements `,` $handle `,` $fetch_data
+    attr-dict `:` type($source) `to` type($target) `,` type($handle) `,`
+    type($fetch_data)
   }];
 }
 
@@ -82,14 +132,17 @@ def MemRefExt_Dma2DStartOp : MemRefExt_Op<"dma_2d_start", [
                        Arg<AnyMemRef, "target memref">:$target,
                        Index:$num_elements,
                        Arg<MemRefExt_DmaHandle, "DMA handle">:$handle,
+                       Arg<MemRefExt_DmaFetchData,
+                           "DMA fetch data">:$fetch_data,
                        Index:$src_stride,
                        Index:$dst_stride,
                        Index:$width);
 
   let assemblyFormat = [{
-    $source `,` $target `,` $num_elements `,` $handle `,`
+    $source `,` $target `,` $num_elements `,` $handle `,` $fetch_data `,`
     $src_stride `,` $dst_stride `,` $width attr-dict
-    `:` type($source) `to` type($target) `,` type($handle)
+    `:` type($source) `to` type($target) `,` type($handle) `,`
+    type($fetch_data)
   }];
 }
 
@@ -111,13 +164,16 @@ def MemRefExt_DmaStartExOp : MemRefExt_Op<"dma_load_ex", [
                        TT_Type:$other,
                        Arg<AnyMemRef, "target memref">:$target,
                        OptionalAttr<BoolAttr>:$is_other_valid,
-                       Arg<MemRefExt_DmaHandle, "DMA handle">:$handle);
+                       Arg<MemRefExt_DmaHandle, "DMA handle">:$handle,
+                       Arg<MemRefExt_DmaFetchData,
+                           "DMA fetch data">:$fetch_data);
   let hasVerifier = 1;
 
   let assemblyFormat = [{
-    $ptr `,` $valid_size `,` $other `,` $target `,` $handle attr-dict
-    `:` type($ptr) `,` type($valid_size) `,` type($other) `,`
-    type($target) `,` type($handle)
+    $ptr `,` $valid_size `,` $other `,` $target `,` $handle `,`
+    $fetch_data attr-dict `:` type($ptr) `,` type($valid_size) `,`
+    type($other) `,` type($target) `,` type($handle) `,`
+    type($fetch_data)
   }];
 }
 
@@ -138,11 +194,14 @@ def MemRefExt_DmaBlockDescriptorLoadOp
                            "::llvm::ArrayRef<int32_t>{}">:$boundaryCheck,
                        OptionalAttr<AnyAttr>:$padding,
                        Arg<AnyMemRef, "target memref">:$target,
-                       Arg<MemRefExt_DmaHandle, "DMA handle">:$handle);
+                       Arg<MemRefExt_DmaHandle, "DMA handle">:$handle,
+                       Arg<MemRefExt_DmaFetchData,
+                           "DMA fetch data">:$fetch_data);
 
   let assemblyFormat = [{
-    $desc `,` $target `,` $handle attr-dict
-    `:` qualified(type($desc)) `,` type($target) `,` type($handle)
+    $desc `,` $target `,` $handle `,` $fetch_data attr-dict
+    `:` qualified(type($desc)) `,` type($target) `,` type($handle) `,`
+    type($fetch_data)
   }];
 }
 
@@ -158,6 +217,46 @@ def MemRefExt_DmaWaitOp : MemRefExt_Op<"dma_wait", [
   let arguments = (ins Arg<MemRefExt_DmaHandle, "DMA handle">:$handle);
 
   let assemblyFormat = "$handle attr-dict `:` type($handle)";
+}
+
+def MemRefExt_SelectDmaHandleOp
+    : MemRefExt_Op<"select_dma_handle", [Pure]> {
+  let summary = "Select one handle from a double-buffered DMA handle pair";
+
+  let description = [{
+    Selects the ping handle when `condition` is true and the pong handle
+    otherwise.
+  }];
+
+  let arguments = (ins I1:$condition,
+                       Arg<MemRefExt_DoubleBufferDmaHandles,
+                           "double-buffered DMA handles">:$handles);
+  let results = (outs MemRefExt_DmaHandle:$result);
+
+  let assemblyFormat = [{
+    $condition `,` $handles attr-dict `:` qualified(type($handles)) `->`
+    type($result)
+  }];
+}
+
+def MemRefExt_SelectDmaFetchDataOp
+    : MemRefExt_Op<"select_dma_fetch_data", [Pure]> {
+  let summary = "Select one fetch data value from a double-buffered pair";
+
+  let description = [{
+    Selects the ping fetch data when `condition` is true and the pong fetch
+    data otherwise.
+  }];
+
+  let arguments = (ins I1:$condition,
+                       Arg<MemRefExt_DoubleBufferDmaFetchData,
+                           "double-buffered DMA fetch data">:$fetch_data);
+  let results = (outs MemRefExt_DmaFetchData:$result);
+
+  let assemblyFormat = [{
+    $condition `,` $fetch_data attr-dict `:` qualified(type($fetch_data))
+    `->` type($result)
+  }];
 }
 
 def MemRefExt_SelectMemrefOp : MemRefExt_Op<"select_memref", [Pure]> {

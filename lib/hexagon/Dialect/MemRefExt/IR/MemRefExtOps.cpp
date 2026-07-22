@@ -28,6 +28,10 @@ void addDmaStartEffects(
                        DmaHandleResource::get());
   effects.emplace_back(MemoryEffects::Write::get(), &op.getHandleMutable(),
                        DmaHandleResource::get());
+  effects.emplace_back(MemoryEffects::Read::get(), &op.getFetchDataMutable(),
+                       DmaFetchDataResource::get());
+  effects.emplace_back(MemoryEffects::Write::get(), &op.getFetchDataMutable(),
+                       DmaFetchDataResource::get());
   effects.emplace_back(MemoryEffects::Write::get(), DmaSyncResource::get());
 }
 
@@ -79,6 +83,10 @@ void DmaStartExOp::getEffects(
                        DmaHandleResource::get());
   effects.emplace_back(MemoryEffects::Write::get(), &getHandleMutable(),
                        DmaHandleResource::get());
+  effects.emplace_back(MemoryEffects::Read::get(), &getFetchDataMutable(),
+                       DmaFetchDataResource::get());
+  effects.emplace_back(MemoryEffects::Write::get(), &getFetchDataMutable(),
+                       DmaFetchDataResource::get());
   effects.emplace_back(MemoryEffects::Write::get(), DmaSyncResource::get());
 }
 
@@ -99,6 +107,10 @@ void DmaBlockDescriptorLoadOp::getEffects(
                        DmaHandleResource::get());
   effects.emplace_back(MemoryEffects::Write::get(), &getHandleMutable(),
                        DmaHandleResource::get());
+  effects.emplace_back(MemoryEffects::Read::get(), &getFetchDataMutable(),
+                       DmaFetchDataResource::get());
+  effects.emplace_back(MemoryEffects::Write::get(), &getFetchDataMutable(),
+                       DmaFetchDataResource::get());
   effects.emplace_back(MemoryEffects::Write::get(), DmaSyncResource::get());
 }
 
@@ -108,6 +120,18 @@ void DmaWaitOp::getEffects(
   effects.emplace_back(MemoryEffects::Read::get(), &getHandleMutable(),
                        DmaHandleResource::get());
   effects.emplace_back(MemoryEffects::Write::get(), DmaSyncResource::get());
+}
+
+LogicalResult CreateAndInitHandlesOp::verify() {
+  if (getHandles().getType().getNumHandles() != 2)
+    return emitOpError("currently supports exactly 2 handles");
+  return success();
+}
+
+LogicalResult CreateDoubleBufferFetchDataOp::verify() {
+  if (getFetchData().getType().getNumFetchData() != 2)
+    return emitOpError("currently supports exactly 2 fetch data values");
+  return success();
 }
 
 LogicalResult SelectMemrefOp::verify() {

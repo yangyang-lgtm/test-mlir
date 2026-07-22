@@ -30,6 +30,11 @@ struct DmaSyncResource : public SideEffects::Resource::Base<DmaSyncResource> {
   StringRef getName() final { return "<DmaSync>"; }
 };
 
+struct DmaFetchDataResource
+    : public SideEffects::Resource::Base<DmaFetchDataResource> {
+  StringRef getName() final { return "<DmaFetchData>"; }
+};
+
 } // namespace memref_ext
 } // namespace mlir
 

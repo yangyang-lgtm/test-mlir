@@ -100,12 +100,12 @@ bool hasCopyRoleAndDirection(memref::CopyOp copy, StringRef role,
 
 /// 根据一个 memref.copy 创建 dma_start，并保留传输方向元数据。
 bool createDMAStartFromCopy(Location loc, IRRewriter &rewriter,
-                            memref::CopyOp copy, Value tag) {
+                            memref::CopyOp copy, Value tag, Value fetchData) {
   // createDMAStartOp 通过输出参数返回新建的 dma_start operation。
   Operation *dmaStart = nullptr;
   // 使用原 copy 的 source/target 和给定 tag 创建异步 DMA start。
   if (!createDMAStartOp(loc, rewriter, copy.getSource(), copy.getTarget(), tag,
-                        &dmaStart))
+                        fetchData, &dmaStart))
     return false;
   // 保留 copy_direction，方便后续 pass 或调试继续区分传输方向。
   if (Attribute direction = copy->getAttr(kCopyDirectionAttrName))
@@ -114,10 +114,36 @@ bool createDMAStartFromCopy(Location loc, IRRewriter &rewriter,
   return true;
 }
 
-Value createDMAHandle(Location loc, IRRewriter &rewriter) {
-  OperationState state(loc, "memref_ext.dma_handle");
-  state.addTypes(memref_ext::DmaHandleType::get(rewriter.getContext()));
+Value createDoubleBufferHandles(Location loc, IRRewriter &rewriter) {
+  OperationState state(loc, "memref_ext.create_and_init_handles");
+  state.addTypes(
+      memref_ext::DoubleBufferDmaHandlesType::get(rewriter.getContext(), 2));
   return rewriter.create(state)->getResult(0);
+}
+
+Value createDoubleBufferFetchData(Location loc, IRRewriter &rewriter) {
+  OperationState state(loc, "memref_ext.create_fetch_data");
+  state.addTypes(
+      memref_ext::DoubleBufferDmaFetchDataType::get(rewriter.getContext(), 2));
+  return rewriter.create(state)->getResult(0);
+}
+
+Value selectDMAHandle(IRRewriter &rewriter, Location loc, Value handles,
+                      Value condition) {
+  return memref_ext::SelectDmaHandleOp::create(
+             rewriter, loc,
+             memref_ext::DmaHandleType::get(rewriter.getContext()), condition,
+             handles)
+      .getResult();
+}
+
+Value selectDMAFetchData(IRRewriter &rewriter, Location loc, Value fetchData,
+                         Value condition) {
+  return memref_ext::SelectDmaFetchDataOp::create(
+             rewriter, loc,
+             memref_ext::DmaFetchDataType::get(rewriter.getContext()),
+             condition, fetchData)
+      .getResult();
 }
 
 /// 使用给定 handle 插入 dma_wait。
@@ -132,7 +158,8 @@ void insertDMAWaits(Location loc, IRRewriter &rewriter,
 
 /// 将一个 prefetch scf.if 中的 memref.copy 替换为 dma_start。
 void replacePrefetchWithDMA(Location loc, IRRewriter &rewriter,
-                            scf::IfOp schedule, ArrayRef<Value> tags) {
+                            scf::IfOp schedule, ArrayRef<Value> tags,
+                            ArrayRef<Value> fetchData) {
   // 先收集 copy，再统一改写，避免遍历 block 时边删边改。
   SmallVector<memref::CopyOp, 3> copies;
   // prefetch if 只使用 then region，且 S1 生成时应只有一个 block。
@@ -158,7 +185,8 @@ void replacePrefetchWithDMA(Location loc, IRRewriter &rewriter,
     // 在 copy 原位置插入 numElements store 和 dma_start。
     rewriter.setInsertionPoint(copy);
     // 用相同 source/target 创建 dma_start。
-    bool created = createDMAStartFromCopy(loc, rewriter, copy, tags[i]);
+    bool created =
+        createDMAStartFromCopy(loc, rewriter, copy, tags[i], fetchData[i]);
     assert(created && "unable to create dma_start");
     // 删除原同步 copy。
     rewriter.eraseOp(copy);
@@ -167,7 +195,8 @@ void replacePrefetchWithDMA(Location loc, IRRewriter &rewriter,
 
 // 将 store copy 替换为 dma_start，并紧跟一个 dma_wait 等待回写完成。
 void replaceStoresWithDMA(Location loc, IRRewriter &rewriter,
-                          KernelSchedule &schedule, ArrayRef<Value> tags) {
+                          KernelSchedule &schedule, ArrayRef<Value> tags,
+                          ArrayRef<Value> fetchData) {
   // 每个 store 对应一个 store tag。
   for (int i = 0; i < schedule.stores.size(); ++i) {
     // 当前 shared_to_global copy。
@@ -175,7 +204,8 @@ void replaceStoresWithDMA(Location loc, IRRewriter &rewriter,
     // 在 store copy 原位置插入 DMA。
     rewriter.setInsertionPoint(copy);
     // 启动异步回写。
-    bool created = createDMAStartFromCopy(loc, rewriter, copy, tags[i]);
+    bool created =
+        createDMAStartFromCopy(loc, rewriter, copy, tags[i], fetchData[i]);
     // 当前实现立即等待 store 完成，保证回写生命周期不越过下一步不安全边界。
     insertDMAWaits(loc, rewriter, tags.slice(i, 1));
     // 删除原同步 store copy。
@@ -218,34 +248,27 @@ void rewriteAsDMATransfers(IRRewriter &rewriter, DBSchedule schedule) {
   // store handle 数量等于 kernel body 中 shared_to_global store 数量。
   auto numStores = schedule.body.stores.size();
 
-  // 为 preload DMA 创建 ping/pong DmaHandle。
-  SmallVector<Value> pingWaits;
-  SmallVector<Value> pongWaits;
-  // 为 store DMA 创建 ping/pong DmaHandle。
-  SmallVector<Value> pingStoreWaits;
-  SmallVector<Value> pongStoreWaits;
+  SmallVector<Value> preloadHandles;
+  SmallVector<Value> preloadFetchData;
+  SmallVector<Value> storeHandles;
+  SmallVector<Value> storeFetchData;
   // 每个 preload tile 一套 ping/pong handle。
   for (auto i = 0; i < preloads.size(); i++) {
-    // ping handle 对应 prologue 或某些轮次的 current slot。
-    Value pingWait = createDMAHandle(loc, rewriter);
-    // pong handle 对应另一个物理 slot。
-    Value pongWait = createDMAHandle(loc, rewriter);
-    // 保存 preload ping handle。
-    pingWaits.push_back(pingWait);
-    // 保存 preload pong handle。
-    pongWaits.push_back(pongWait);
+    Value handles = createDoubleBufferHandles(loc, rewriter);
+    Value fetchData = createDoubleBufferFetchData(loc, rewriter);
+    preloadHandles.push_back(handles);
+    preloadFetchData.push_back(fetchData);
   }
   // 每个 store 也需要 ping/pong handle，因为 current slot 会交替变化。
   for (auto i = 0; i < numStores; ++i) {
-    // store ping handle。
-    Value ping = createDMAHandle(loc, rewriter);
-    // store pong handle。
-    Value pong = createDMAHandle(loc, rewriter);
-    // 保存 store ping handle。
-    pingStoreWaits.push_back(ping);
-    // 保存 store pong handle。
-    pongStoreWaits.push_back(pong);
+    Value handles = createDoubleBufferHandles(loc, rewriter);
+    Value fetchData = createDoubleBufferFetchData(loc, rewriter);
+    storeHandles.push_back(handles);
+    storeFetchData.push_back(fetchData);
   }
+
+  Value trueValue = arith::ConstantOp::create(rewriter, loc,
+                                              rewriter.getBoolAttr(true));
 
   // 将 prologue 的第一轮 preload copy 改写成 ping dma_start。
   for (auto i = 0; i < preloads.size(); i++) {
@@ -254,7 +277,12 @@ void rewriteAsDMATransfers(IRRewriter &rewriter, DBSchedule schedule) {
     // 在原 copy 位置插入 DMA。
     rewriter.setInsertionPoint(op);
     // prologue 总是启动 ping 方向的第一轮 preload。
-    bool created = createDMAStartFromCopy(loc, rewriter, op, pingWaits[i]);
+    Value pingWait = selectDMAHandle(rewriter, loc, preloadHandles[i],
+                                     trueValue);
+    Value pingFetch =
+        selectDMAFetchData(rewriter, loc, preloadFetchData[i], trueValue);
+    bool created = createDMAStartFromCopy(loc, rewriter, op, pingWait,
+                                          pingFetch);
     assert(created && "unable to create dma_start");
     // 删除原同步 copy。
     rewriter.eraseOp(op);
@@ -270,36 +298,44 @@ void rewriteAsDMATransfers(IRRewriter &rewriter, DBSchedule schedule) {
   Value cur = schedule.kernel.getRegionIterArgs().front();
   // handle select 应插在 kernel prefetch if 之前，供后续 wait/prefetch/store 使用。
   rewriter.setInsertionPoint(schedule.body.prefetch);
+  Value next = arith::XOrIOp::create(rewriter, loc, cur, trueValue);
   // 当前轮 preload wait 使用的 handle。
   SmallVector<Value> currentWaits;
   // 下一轮 preload dma_start 使用的 handle。
   SmallVector<Value> nextWaits;
+  SmallVector<Value> nextFetchData;
   // 根据 cur 在 ping/pong 之间选择 current/next。
-  for (auto [ping, pong] : llvm::zip(pingWaits, pongWaits)) {
+  for (Value handles : preloadHandles) {
     // cur=true 时当前等待 ping，否则等待 pong。
-    currentWaits.push_back(
-        arith::SelectOp::create(rewriter, loc, cur, ping, pong));
+    currentWaits.push_back(selectDMAHandle(rewriter, loc, handles, cur));
     // cur=true 时下一轮写 pong，否则写 ping。
-    nextWaits.push_back(
-        arith::SelectOp::create(rewriter, loc, cur, pong, ping));
+    nextWaits.push_back(selectDMAHandle(rewriter, loc, handles, next));
   }
+  for (Value fetchData : preloadFetchData)
+    nextFetchData.push_back(
+        selectDMAFetchData(rewriter, loc, fetchData, next));
 
   // 当前轮 store 使用的 tag；store 只需要 current，不需要 next。
   SmallVector<Value> currentStoreWaits;
+  SmallVector<Value> currentStoreFetchData;
   // 根据 cur 选择 store ping/pong tag。
-  for (auto [ping, pong] : llvm::zip(pingStoreWaits, pongStoreWaits))
-    currentStoreWaits.push_back(
-        arith::SelectOp::create(rewriter, loc, cur, ping, pong));
+  for (Value handles : storeHandles)
+    currentStoreWaits.push_back(selectDMAHandle(rewriter, loc, handles, cur));
+  for (Value fetchData : storeFetchData)
+    currentStoreFetchData.push_back(
+        selectDMAFetchData(rewriter, loc, fetchData, cur));
 
   // 先启动下一轮 tile 的 DMA 预取，再在进入当前 compute slice 前等待当前 tile。
   // 这就是 S1 结构化排布和 S2 DMA 化共同实现的 overlap。
-  replacePrefetchWithDMA(loc, rewriter, schedule.body.prefetch, nextWaits);
+  replacePrefetchWithDMA(loc, rewriter, schedule.body.prefetch, nextWaits,
+                         nextFetchData);
   // 在 prefetch if 之后、compute 之前等待当前 tile 的 preload DMA 完成。
   rewriter.setInsertionPointAfter(schedule.body.prefetch);
   insertDMAWaits(loc, rewriter, currentWaits);
 
   // 将当前轮 store copy 转成 DMA start + wait。
-  replaceStoresWithDMA(loc, rewriter, schedule.body, currentStoreWaits);
+  replaceStoresWithDMA(loc, rewriter, schedule.body, currentStoreWaits,
+                       currentStoreFetchData);
 
   // db_compute 只用于 S1/S2 之间传递调度信息，DMA 改写完成后清理。
   for (Operation *compute : schedule.body.computeOps)

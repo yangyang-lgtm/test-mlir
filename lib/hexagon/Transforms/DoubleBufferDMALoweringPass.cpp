@@ -16,6 +16,8 @@
 #include "hexagon/Transforms/CopyDirection.h"
 #include "hexagon/Transforms/Passes.h"
 
+#include "llvm/ADT/STLExtras.h"
+
 using namespace mlir;
 using namespace mlir::hexagon;
 
@@ -66,11 +68,11 @@ Value computeNumElements(Location loc, IRRewriter &rewriter, Value memref) {
 
 // 根据一个 memref.copy 创建对应的 DMA start，并保留 copy direction 属性。
 bool createDMAStartFromCopy(IRRewriter &rewriter, memref::CopyOp copy,
-                            Value handle) {
+                            Value handle, Value fetchData) {
   // createDMAStartOp 会根据 source/target 构造具体 DMA start 操作。
   Operation *dmaStart = nullptr;
   if (!createDMAStartOp(copy.getLoc(), rewriter, copy.getSource(),
-                        copy.getTarget(), handle, &dmaStart))
+                        copy.getTarget(), handle, fetchData, &dmaStart))
     return false;
   // 将原 copy 的方向属性复制到 DMA start，方便后续 pass 或调试识别。
   if (Attribute direction = copy->getAttr(kCopyDirectionAttrName))
@@ -79,14 +81,36 @@ bool createDMAStartFromCopy(IRRewriter &rewriter, memref::CopyOp copy,
   return true;
 }
 
-// 创建一个 memref_ext.dma_handle，作为 DMA start/wait 的同步句柄。
-Value createDMAHandle(Location loc, IRRewriter &rewriter) {
-  // 使用 OperationState 是为了按名字创建扩展 dialect 的 handle op。
-  OperationState state(loc, "memref_ext.dma_handle");
-  // handle op 产生一个 memref_ext::DmaHandleType 结果。
-  state.addTypes(memref_ext::DmaHandleType::get(rewriter.getContext()));
-  // 返回新建 handle 的第一个结果。
+Value createDoubleBufferHandles(Location loc, IRRewriter &rewriter) {
+  OperationState state(loc, "memref_ext.create_and_init_handles");
+  state.addTypes(
+      memref_ext::DoubleBufferDmaHandlesType::get(rewriter.getContext(), 2));
   return rewriter.create(state)->getResult(0);
+}
+
+Value createDoubleBufferFetchData(Location loc, IRRewriter &rewriter) {
+  OperationState state(loc, "memref_ext.create_fetch_data");
+  state.addTypes(
+      memref_ext::DoubleBufferDmaFetchDataType::get(rewriter.getContext(), 2));
+  return rewriter.create(state)->getResult(0);
+}
+
+Value selectDMAHandle(IRRewriter &rewriter, Location loc, Value handles,
+                      Value condition) {
+  return memref_ext::SelectDmaHandleOp::create(
+             rewriter, loc,
+             memref_ext::DmaHandleType::get(rewriter.getContext()), condition,
+             handles)
+      .getResult();
+}
+
+Value selectDMAFetchData(IRRewriter &rewriter, Location loc, Value fetchData,
+                         Value condition) {
+  return memref_ext::SelectDmaFetchDataOp::create(
+             rewriter, loc,
+             memref_ext::DmaFetchDataType::get(rewriter.getContext()),
+             condition, fetchData)
+      .getResult();
 }
 
 // 生成 numElements > 0 的谓词，避免对空 memref 发起 DMA 或 wait。
@@ -141,7 +165,8 @@ LogicalResult createIfPositive(IRRewriter &rewriter, Location loc,
 
 // 用带元素数记录和空拷贝保护的 DMA start 替换一个 memref.copy。
 bool replaceCopyWithRecordedDMAStart(IRRewriter &rewriter, memref::CopyOp copy,
-                                     Value handle, Value numElementSlot,
+                                     Value handle, Value fetchData,
+                                     Value numElementSlot,
                                      ArrayRef<Value> tagIndex) {
   // 新操作插入到原 copy 的位置。
   rewriter.setInsertionPoint(copy);
@@ -154,7 +179,7 @@ bool replaceCopyWithRecordedDMAStart(IRRewriter &rewriter, memref::CopyOp copy,
   // 只有元素数大于 0 时才发起 DMA start。
   if (failed(createIfPositive(rewriter, copy.getLoc(), numElements, [&] {
     // 在 then block 内创建 DMA start。
-    if (!createDMAStartFromCopy(rewriter, copy, handle))
+    if (!createDMAStartFromCopy(rewriter, copy, handle, fetchData))
       return failure();
     // 回调成功表示 then block 构造完成。
     return success();
@@ -307,9 +332,12 @@ bool lowerSchedule(IRRewriter &rewriter, PlannedSchedule &schedule) {
   SmallVector<Value> tagIndex{zero};
   auto numType = MemRefType::get({1}, rewriter.getIndexType());
 
-  // ping/pong load 分别使用一个 DMA handle。
-  Value pingLoadHandle = createDMAHandle(loc, rewriter);
-  Value pongLoadHandle = createDMAHandle(loc, rewriter);
+  Value loadHandles = createDoubleBufferHandles(loc, rewriter);
+  SmallVector<Value> loadFetchData;
+  loadFetchData.reserve(schedule.prologueLoads.size());
+  for (size_t index = 0; index < schedule.prologueLoads.size(); ++index) {
+    loadFetchData.push_back(createDoubleBufferFetchData(loc, rewriter));
+  }
   // ping/pong 分别记录最近一次 DMA 的元素数，用来保护 wait。
   Value pingNumElements = memref::AllocOp::create(rewriter, loc, numType);
   Value pongNumElements = memref::AllocOp::create(rewriter, loc, numType);
@@ -318,8 +346,18 @@ bool lowerSchedule(IRRewriter &rewriter, PlannedSchedule &schedule) {
   initializeNumElementSlot(rewriter, loc, pongNumElements, tagIndex);
 
   // 首轮预取写入 ping buffer，并记录 ping 的元素数。
+  Value trueValue = arith::ConstantOp::create(rewriter, loc,
+                                              rewriter.getBoolAttr(true));
+  Value pingLoadHandle = selectDMAHandle(rewriter, loc, loadHandles, trueValue);
+  SmallVector<Value> pingLoadFetchData;
+  pingLoadFetchData.reserve(schedule.prologueLoads.size());
+  for (Value pair : loadFetchData)
+    pingLoadFetchData.push_back(
+        selectDMAFetchData(rewriter, loc, pair, trueValue));
+  size_t fetchIndex = 0;
   for (memref::CopyOp copy : schedule.prologueLoads) {
     if (!replaceCopyWithRecordedDMAStart(rewriter, copy, pingLoadHandle,
+                                         pingLoadFetchData[fetchIndex++],
                                          pingNumElements,
                                          tagIndex))
       return false;
@@ -329,14 +367,15 @@ bool lowerSchedule(IRRewriter &rewriter, PlannedSchedule &schedule) {
   Value current = schedule.kernel.getRegionIterArgs().front();
   // 在 prefetch 之前计算当前轮 wait 和下一轮 start 要用的 handle/计数槽。
   rewriter.setInsertionPoint(schedule.prefetch);
+  Value next = arith::XOrIOp::create(rewriter, loc, current, trueValue);
   // currentLoadHandle 对应当前计算正在消费的 buffer。
-  Value currentLoadHandle =
-      arith::SelectOp::create(rewriter, loc, current, pingLoadHandle,
-                              pongLoadHandle);
+  Value currentLoadHandle = selectDMAHandle(rewriter, loc, loadHandles, current);
   // nextLoadHandle 对应下一轮预取要填充的 buffer。
-  Value nextLoadHandle =
-      arith::SelectOp::create(rewriter, loc, current, pongLoadHandle,
-                              pingLoadHandle);
+  Value nextLoadHandle = selectDMAHandle(rewriter, loc, loadHandles, next);
+  SmallVector<Value> nextLoadFetchData;
+  nextLoadFetchData.reserve(schedule.nextLoads.size());
+  for (Value pair : loadFetchData)
+    nextLoadFetchData.push_back(selectDMAFetchData(rewriter, loc, pair, next));
   // currentNumElements 是当前 buffer 上一次 DMA 记录的元素数。
   Value currentNumElements =
       arith::SelectOp::create(rewriter, loc, current, pingNumElements,
@@ -349,8 +388,10 @@ bool lowerSchedule(IRRewriter &rewriter, PlannedSchedule &schedule) {
   initializeNumElementSlot(rewriter, loc, nextNumElements, tagIndex);
 
   // 将循环内下一轮预取 copy 替换成 DMA start。
+  fetchIndex = 0;
   for (memref::CopyOp copy : schedule.nextLoads) {
     if (!replaceCopyWithRecordedDMAStart(rewriter, copy, nextLoadHandle,
+                                         nextLoadFetchData[fetchIndex++],
                                          nextNumElements,
                                          tagIndex))
       return false;
