@@ -433,9 +433,9 @@ public:
   }
 
   void applyMove(const ExtMove &move) const { // 只有分析证明安全后才实际修改 IR 顺序。
+    move.op->moveBefore(move.insertionPoint); // 先把 load/store 本身移到插入点，后续 movableDefs 逐个插到它前面，保证操作数在使用之前。
     for (Operation *op : move.movableDefs)
-      op->moveBefore(move.insertionPoint); // 插入点表示该操作在保持依赖后能到达的最早或最晚位置。
-    move.op->moveBefore(move.insertionPoint); // 插入点表示该操作在保持依赖后能到达的最早或最晚位置。
+      op->moveBefore(move.op); // 地址/size 定义必须在 load 之前，moveBefore(move.op) 保证每次插入紧挨 load 前方。
   }
 
 private:

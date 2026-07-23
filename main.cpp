@@ -117,6 +117,8 @@ static void initRegistry(mlir::DialectRegistry &registry) {
 // 暂时跑这几个测试，其他的后续补充
 // --schedule-double-buffer-load-store-ext-only 的 case 更贴近实际
 // 其他更符合开源 triton-shared
+// // https://github.com/yangyang-lgtm/test-mlir
+
 int main(int argc, char **argv) {
   if (argc != 2 && argc != 3) {
     llvm::outs() << "run as : " << argv[0] << " xxx.mlir\n";
@@ -152,8 +154,8 @@ int main(int argc, char **argv) {
         mlir::hexagon::createScheduleDoubleBufferLoadStoreExtPass());
     manager.addNestedPass<mlir::func::FuncOp>(
         mlir::hexagon::createHexagonDoubleBufferPlanRewriteExtPass());
-    manager.addNestedPass<mlir::func::FuncOp>(
-        mlir::hexagon::createHexagonDoubleBufferDMALoweringExtPass());
+    // manager.addNestedPass<mlir::func::FuncOp>(
+    //     mlir::hexagon::createHexagonDoubleBufferDMALoweringExtPass());
 
     // manager.addPass(mlir::createCanonicalizerPass());
     // manager.addPass(mlir::createCSEPass());

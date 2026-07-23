@@ -1092,6 +1092,18 @@ def TT_MakeBlockDescOp : TT_Op<"make_block_desc", [Pure]> {
   let results = (outs TT_BlockDescType:$result);
 }
 
+def TT_BlockDescAdvanceOp : TT_Op<"block_desc_advance", [Pure]> {
+  let summary = "Advance a block descriptor by offsets";
+
+  let arguments = (ins
+    TT_BlockDescType:$desc,
+    I32:$offset0,
+    I32:$offset1
+  );
+
+  let results = (outs TT_BlockDescType:$result);
+}
+
 // The following ops, including `call`, `func`, and `return` are copied and modified from
 // https://github.com/llvm/llvm-project/blob/main/mlir/include/mlir/Dialect/Func/IR/FuncOps.td
 // We could revert it back once MLIR has a better inliner interface.

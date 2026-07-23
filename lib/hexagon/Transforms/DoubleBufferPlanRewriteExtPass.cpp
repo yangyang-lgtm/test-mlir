@@ -511,6 +511,8 @@ bool rewritePlan(IRRewriter &rewriter, Plan &plan, int64_t planId) { // 用 prol
     mapping.map(loop.getInductionVar(), first); // 把原循环 iv 映射到首轮下标，克隆首轮 load 时复用原地址计算。
     for (auto [index, tile] : llvm::enumerate(plan.tiles))
       mapping.map(tile.root, pingBuffers[index]); // 首轮预取写入 ping buffer，供第一轮计算读取。
+    for (auto [index, iterArg] : llvm::enumerate(loop.getRegionIterArgs()))
+      mapping.map(iterArg, loop.getInitArgs()[index]); // prologue 在 loop 外部，iter_arg 必须映射到 init_arg 以避免引用被删除的 block argument。
     for (TileInfo tile : plan.tiles)
       if (tile.load) // prologue 只克隆输入 tile 的 load_ex，store-only tile 没有首轮预取来源。
         cloneTransfer(tile.load, rewriter, mapping, sourceBlock, // 传输操作需要额外角色属性，供后续 lowering 区分 DMA start/store。
@@ -552,21 +554,6 @@ bool rewritePlan(IRRewriter &rewriter, Plan &plan, int64_t planId) { // 用 prol
     Value hasNext = // 最后一轮没有下一块数据，必须跳过循环内预取。
         arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::slt, nextIv, // 下一轮下标用于克隆原 load 的地址和边界计算。
                               dbLoop.getUpperBound());
-    auto prefetch = scf::IfOp::create(rewriter, loc, hasNext, // 最后一轮没有下一块数据，必须跳过循环内预取。
-                                      /*withElseRegion=*/false);
-    prefetch->setAttr(kPlanPrefetchAttr, UnitAttr::get(context)); // 标记循环内下一轮预取区域，帮助 DMA lowering 做角色区分。
-    {
-      OpBuilder::InsertionGuard ifGuard(rewriter);
-      rewriter.setInsertionPointToStart(prefetch.thenBlock()); // 循环开头提前启动下一轮 DMA，以便与当前轮计算重叠。
-      IRMapping mapping;
-      mapping.map(loop.getInductionVar(), nextIv); // 下一轮下标用于克隆原 load 的地址和边界计算。
-      for (auto [index, tile] : llvm::enumerate(plan.tiles))
-        mapping.map(tile.root, nextViews[index]); // 下一轮视图提供给提前发起的 prefetch。
-      for (TileInfo tile : plan.tiles)
-        if (tile.load) // steady-state 只为有 load_ex 的 tile 预取下一轮，避免为 store-only tile 生成无意义 DMA。
-          cloneTransfer(tile.load, rewriter, mapping, sourceBlock, // 传输操作需要额外角色属性，供后续 lowering 区分 DMA start/store。
-                        kPrefetchRole);
-    }
 
     IRMapping currentMapping; // 当前轮映射把原 tile 根替换成本轮选中的 buffer。
     currentMapping.map(loop.getInductionVar(), dbLoop.getInductionVar()); // 当前轮映射把原 tile 根替换成本轮选中的 buffer。
@@ -577,7 +564,53 @@ bool rewritePlan(IRRewriter &rewriter, Plan &plan, int64_t planId) { // 用 prol
     for (auto [index, iterArg] : llvm::enumerate(origIterArgs))
       currentMapping.map(iterArg, newIterArgs[index + 1]); // +1 跳过 ping/pong 状态 iter_arg。
 
+    // 把纯地址计算 op（如 block_desc_advance）提前克隆，让 prefetch 能用 advance 后的 descriptor 发起下一轮 DMA。
+    // 这些 op 无 tile 内存副作用，提前执行不影响计算语义；后续 steadyOps 循环中跳过它们避免重复克隆。
+    DenseSet<Operation *> clonedBeforePrefetch;
+    for (Operation *op : plan.steadyOps) {
+      if (getTransferLike(op)) // load/store 由专门路径处理，不属于地址计算。
+        continue;
+      if (!isMemoryEffectFree(op)) // 有内存副作用的 op 不能提前，否则会改变 tile 数据流的时序。
+        continue;
+      bool touchesTile = false;
+      for (Value result : op->getResults()) {
+        for (const TileInfo &tile : plan.tiles) {
+          if (result == tile.root) {
+            touchesTile = true;
+            break;
+          }
+        }
+        if (touchesTile)
+          break;
+      }
+      if (touchesTile) // 结果是某个 tile 根内存时不能提前，避免和 ping/pong 选择冲突。
+        continue;
+      cloneMappedOp(op, rewriter, currentMapping, sourceBlock, /*markCompute=*/true);
+      clonedBeforePrefetch.insert(op);
+    }
+
+    auto prefetch = scf::IfOp::create(rewriter, loc, hasNext, // 最后一轮没有下一块数据，必须跳过循环内预取。
+                                      /*withElseRegion=*/false);
+    prefetch->setAttr(kPlanPrefetchAttr, UnitAttr::get(context)); // 标记循环内下一轮预取区域，帮助 DMA lowering 做角色区分。
+    {
+      OpBuilder::InsertionGuard ifGuard(rewriter);
+      rewriter.setInsertionPointToStart(prefetch.thenBlock()); // prefetch 在 compute/store 之前发起 DMA，实现与当前轮计算的重叠。
+      IRMapping mapping;
+      mapping.map(loop.getInductionVar(), nextIv); // 下一轮下标用于克隆原 load 的地址和边界计算。
+      for (auto [index, tile] : llvm::enumerate(plan.tiles))
+        mapping.map(tile.root, nextViews[index]); // 下一轮视图提供给提前发起的 prefetch。
+      auto origYieldForPrefetch = cast<scf::YieldOp>(loop.getBody()->getTerminator());
+      for (auto [index, iterArg] : llvm::enumerate(loop.getRegionIterArgs()))
+        mapping.map(iterArg, currentMapping.lookupOrDefault(origYieldForPrefetch.getOperand(index))); // yield 的第 N 个操作数就是下一轮的第 N 个 iter_arg，通过 currentMapping 查到 advance 后的克隆结果。
+      for (TileInfo tile : plan.tiles)
+        if (tile.load) // steady-state 只为有 load_ex 的 tile 预取下一轮，避免为 store-only tile 生成无意义 DMA。
+          cloneTransfer(tile.load, rewriter, mapping, sourceBlock, // 传输操作需要额外角色属性，供后续 lowering 区分 DMA start/store。
+                        kPrefetchRole);
+    }
+
     for (Operation *op : plan.steadyOps) { // 按原顺序克隆 compute/store/scratch，保持副作用次序与数据流语义。
+      if (clonedBeforePrefetch.count(op)) // 已在 prefetch 前克隆的地址计算 op 不重复克隆。
+        continue;
       std::optional<TransferLike> transfer = getTransferLike(op);
       if (transfer && transfer->isStore()) // 写回 store 需要 copy-role，供后续 lowering 区分。
         cloneTransfer(op, rewriter, currentMapping, sourceBlock, kDB2StoreRole);
