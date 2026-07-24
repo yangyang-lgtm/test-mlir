@@ -21,6 +21,7 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "triton/Dialect/Triton/IR/Dialect.h"
 #include "llvm/Support/Debug.h"
 #define DEBUG_TYPE "dma-to-llvm"
 
@@ -764,6 +765,12 @@ struct DMAToLLVMPass : public ::impl::DMAToLLVMBase<DMAToLLVMPass> {
     typeConverter.addConversion([context](memref_ext::DmaHandleType type) {
       return LLVM::LLVMPointerType::get(context);
     });
+    typeConverter.addConversion(
+        [context](triton::PointerType type) -> Type {
+          if (isa<memref_ext::DmaHandleType>(type.getPointeeType()))
+            return LLVM::LLVMPointerType::get(context);
+          return Type();
+        });
     typeConverter.addConversion(
         [context](memref_ext::DoubleBufferDmaHandlesType type) -> Type {
           if (type.getNumHandles() != 2)

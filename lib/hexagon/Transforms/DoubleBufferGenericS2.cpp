@@ -24,6 +24,8 @@
 #include "hexagon/Transforms/Passes.h"
 #include "hexagon/Transforms/Transforms.h"
 
+#include "triton/Dialect/Triton/IR/Dialect.h"
+
 #include "mlir/Conversion/Passes.h"
 #include "mlir/Dialect/Arith/Utils/Utils.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
@@ -132,8 +134,9 @@ Value selectDMAHandle(IRRewriter &rewriter, Location loc, Value handles,
                       Value condition) {
   return memref_ext::SelectDmaHandleOp::create(
              rewriter, loc,
-             memref_ext::DmaHandleType::get(rewriter.getContext()), condition,
-             handles)
+             triton::PointerType::get(
+                 memref_ext::DmaHandleType::get(rewriter.getContext()), 1),
+             condition, handles)
       .getResult();
 }
 

@@ -28,9 +28,9 @@ def MemRefExt_DmaHandleOp : MemRefExt_Op<"dma_handle"> {
     independent.
   }];
 
-  let results = (outs MemRefExt_DmaHandle:$handle);
+  let results = (outs TT_PtrOf<[MemRefExt_DmaHandle]>:$handle);
 
-  let assemblyFormat = "attr-dict `:` type($handle)";
+  let assemblyFormat = "attr-dict `:` qualified(type($handle))";
 }
 
 def MemRefExt_CreateAndInitHandlesOp
@@ -100,14 +100,14 @@ def MemRefExt_DmaStartOp : MemRefExt_Op<"dma_start", [
   let arguments = (ins Arg<AnyType, "source memory object">:$source,
                        Arg<AnyType, "target memory object">:$target,
                        Index:$num_elements,
-                       Arg<MemRefExt_DmaHandle, "DMA handle">:$handle,
+                       Arg<TT_PtrOf<[MemRefExt_DmaHandle]>, "DMA handle">:$handle,
                        Arg<MemRefExt_DmaFetchData,
                            "DMA fetch data">:$fetch_data);
   let hasVerifier = 1;
 
   let assemblyFormat = [{
     $source `,` $target `,` $num_elements `,` $handle `,` $fetch_data
-    attr-dict `:` type($source) `to` type($target) `,` type($handle) `,`
+    attr-dict `:` type($source) `to` type($target) `,` qualified(type($handle)) `,`
     type($fetch_data)
   }];
 }
@@ -131,7 +131,7 @@ def MemRefExt_Dma2DStartOp : MemRefExt_Op<"dma_2d_start", [
   let arguments = (ins Arg<AnyMemRef, "source memref">:$source,
                        Arg<AnyMemRef, "target memref">:$target,
                        Index:$num_elements,
-                       Arg<MemRefExt_DmaHandle, "DMA handle">:$handle,
+                       Arg<TT_PtrOf<[MemRefExt_DmaHandle]>, "DMA handle">:$handle,
                        Arg<MemRefExt_DmaFetchData,
                            "DMA fetch data">:$fetch_data,
                        Index:$src_stride,
@@ -141,7 +141,7 @@ def MemRefExt_Dma2DStartOp : MemRefExt_Op<"dma_2d_start", [
   let assemblyFormat = [{
     $source `,` $target `,` $num_elements `,` $handle `,` $fetch_data `,`
     $src_stride `,` $dst_stride `,` $width attr-dict
-    `:` type($source) `to` type($target) `,` type($handle) `,`
+    `:` type($source) `to` type($target) `,` qualified(type($handle)) `,`
     type($fetch_data)
   }];
 }
@@ -164,7 +164,7 @@ def MemRefExt_DmaStartExOp : MemRefExt_Op<"dma_load_ex", [
                        TT_Type:$other,
                        Arg<AnyMemRef, "target memref">:$target,
                        OptionalAttr<BoolAttr>:$is_other_valid,
-                       Arg<MemRefExt_DmaHandle, "DMA handle">:$handle,
+                       Arg<TT_PtrOf<[MemRefExt_DmaHandle]>, "DMA handle">:$handle,
                        Arg<MemRefExt_DmaFetchData,
                            "DMA fetch data">:$fetch_data);
   let hasVerifier = 1;
@@ -172,7 +172,7 @@ def MemRefExt_DmaStartExOp : MemRefExt_Op<"dma_load_ex", [
   let assemblyFormat = [{
     $ptr `,` $valid_size `,` $other `,` $target `,` $handle `,`
     $fetch_data attr-dict `:` type($ptr) `,` type($valid_size) `,`
-    type($other) `,` type($target) `,` type($handle) `,`
+    type($other) `,` type($target) `,` qualified(type($handle)) `,`
     type($fetch_data)
   }];
 }
@@ -194,13 +194,13 @@ def MemRefExt_DmaBlockDescriptorLoadOp
                            "::llvm::ArrayRef<int32_t>{}">:$boundaryCheck,
                        OptionalAttr<AnyAttr>:$padding,
                        Arg<AnyMemRef, "target memref">:$target,
-                       Arg<MemRefExt_DmaHandle, "DMA handle">:$handle,
+                       Arg<TT_PtrOf<[MemRefExt_DmaHandle]>, "DMA handle">:$handle,
                        Arg<MemRefExt_DmaFetchData,
                            "DMA fetch data">:$fetch_data);
 
   let assemblyFormat = [{
     $desc `,` $target `,` $handle `,` $fetch_data attr-dict
-    `:` qualified(type($desc)) `,` type($target) `,` type($handle) `,`
+    `:` qualified(type($desc)) `,` type($target) `,` qualified(type($handle)) `,`
     type($fetch_data)
   }];
 }
@@ -214,9 +214,9 @@ def MemRefExt_DmaWaitOp : MemRefExt_Op<"dma_wait", [
     Waits for the DMA transfers grouped by the given DmaHandle.
   }];
 
-  let arguments = (ins Arg<MemRefExt_DmaHandle, "DMA handle">:$handle);
+  let arguments = (ins Arg<TT_PtrOf<[MemRefExt_DmaHandle]>, "DMA handle">:$handle);
 
-  let assemblyFormat = "$handle attr-dict `:` type($handle)";
+  let assemblyFormat = "$handle attr-dict `:` qualified(type($handle))";
 }
 
 def MemRefExt_SelectDmaHandleOp
@@ -231,11 +231,11 @@ def MemRefExt_SelectDmaHandleOp
   let arguments = (ins I1:$condition,
                        Arg<MemRefExt_DoubleBufferDmaHandles,
                            "double-buffered DMA handles">:$handles);
-  let results = (outs MemRefExt_DmaHandle:$result);
+  let results = (outs TT_PtrOf<[MemRefExt_DmaHandle]>:$result);
 
   let assemblyFormat = [{
     $condition `,` $handles attr-dict `:` qualified(type($handles)) `->`
-    type($result)
+    qualified(type($result))
   }];
 }
 

@@ -1092,7 +1092,7 @@ def TT_MakeBlockDescOp : TT_Op<"make_block_desc", [Pure]> {
   let results = (outs TT_BlockDescType:$result);
 }
 
-def TT_BlockDescAdvanceOp : TT_Op<"block_desc_advance", [Pure]> {
+def TT_BlockDescAdvanceOp : TT_Op<"block_desc_advance", [Pure, MemoryEffects<[MemWrite<GlobalMemory>]>]> {
   let summary = "Advance a block descriptor by offsets";
 
   let arguments = (ins

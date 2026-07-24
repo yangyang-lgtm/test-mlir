@@ -15,6 +15,8 @@
 #include "mlir/Interfaces/FunctionInterfaces.h" // 当前 pass 运行在 FunctionOpInterface 上。
 #include "mlir/Pass/Pass.h" // 引入 MLIR pass 基础设施。
 
+#include "triton/Dialect/Triton/IR/Dialect.h" // triton::PointerType 用于 tt.ptr<dma_handle> 结果类型。
+
 #include "llvm/ADT/STLExtras.h"
 
 using namespace mlir; // 简化 MLIR 类型和 builder API 的命名空间书写。
@@ -59,7 +61,9 @@ Value createDoubleBufferFetchData(Location loc, IRRewriter &rewriter) {
 Value selectDMAHandle(IRRewriter &rewriter, Location loc, Value handles,
                       Value condition) {
   return memref_ext::SelectDmaHandleOp::create(
-             rewriter, loc, memref_ext::DmaHandleType::get(rewriter.getContext()),
+             rewriter, loc,
+             triton::PointerType::get(
+                 memref_ext::DmaHandleType::get(rewriter.getContext()), 1),
              condition, handles)
       .getResult();
 }

@@ -154,8 +154,8 @@ int main(int argc, char **argv) {
         mlir::hexagon::createScheduleDoubleBufferLoadStoreExtPass());
     manager.addNestedPass<mlir::func::FuncOp>(
         mlir::hexagon::createHexagonDoubleBufferPlanRewriteExtPass());
-    // manager.addNestedPass<mlir::func::FuncOp>(
-    //     mlir::hexagon::createHexagonDoubleBufferDMALoweringExtPass());
+    manager.addNestedPass<mlir::func::FuncOp>(
+        mlir::hexagon::createHexagonDoubleBufferDMALoweringExtPass());
 
     // manager.addPass(mlir::createCanonicalizerPass());
     // manager.addPass(mlir::createCSEPass());
